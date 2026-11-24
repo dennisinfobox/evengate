@@ -1,0 +1,62 @@
+{
+  "phase": "reviewing",
+  "task_created": true,
+  "spec": {
+    "title": "hello",
+    "goal": "Create a Rust binary crate `hello` from the template at `templates/bin/`, verify that it compiles, passes its tests, and is clean under clippy, then open a pull request for the result.",
+    "acceptance": [
+      "`cargo check --locked` exits 0 in the sandbox.",
+      "`cargo test --locked` exits 0 in the sandbox.",
+      "`cargo clippy --locked -- -D warnings` exits 0 in the sandbox.",
+      "A branch containing the crate is pushed and a pull request is recorded."
+    ],
+    "constraints": [
+      "Rust only, no external crates.",
+      "No network access inside the sandbox.",
+      "The crate is generated from `templates/bin/`; the template is the only source of code."
+    ],
+    "non_goals": [
+      "No LLM involvement.",
+      "No review agent.",
+      "No knowledge artifacts."
+    ],
+    "context": [
+      "`docs/spec.md` §11 and §14."
+    ],
+    "open_questions": []
+  },
+  "artifacts": [
+    {
+      "path": "project",
+      "kind": "tree"
+    }
+  ],
+  "gate_results": {
+    "compiles": {
+      "result": "pass"
+    },
+    "tests_pass": {
+      "result": "pass"
+    },
+    "lints_clean": {
+      "result": "pass"
+    }
+  },
+  "gate_attempts": {
+    "compiles": 1,
+    "tests_pass": 1,
+    "lints_clean": 1
+  },
+  "token_spend": {
+    "input": 0,
+    "output": 0
+  },
+  "human_decision": null,
+  "agent_invocations": 1,
+  "agent_responses": 1,
+  "pr_url": "file:///C:/Users/Dennis/source/repos/evengate/tasks/hello/artifacts/remote.git#ev/hello",
+  "merged_commit": null,
+  "abandoned_reason": null,
+  "last_tick": null,
+  "anomalies": []
+}

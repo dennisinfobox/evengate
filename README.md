@@ -4,7 +4,7 @@ A deterministic, Rust-native software factory that builds and improves itself un
 
 **Evengate** = *event* + *gate*: all state is derived from an append-only event log, and nothing moves without passing a gate.
 
-Status: seed kernel (v0). The system does not exist yet; it is being built from `docs/spec.md`.
+Status: seed kernel works for one scenario — generate a crate from `templates/bin/`, gate it, open a pull request. See `docs/STATUS.md`.
 
 ## Documentation
 
@@ -17,14 +17,21 @@ Status: seed kernel (v0). The system does not exist yet; it is being built from 
 
 ## Quickstart
 
-No code yet. Planned interface:
-
 ```sh
-ev run tasks/hello/spec.md   # execute a task spec end to end
-ev replay tasks/hello        # reconstruct state offline, byte-identical
+docker build -t evengate-sandbox:1.100 sandbox   # once: clippy + rustfmt inside
+cargo build --locked
+
+cargo run --locked --bin ev -- run tasks/hello/spec.md
+cargo run --locked --bin ev -- replay tasks/hello
+
+# after reviewing the branch:
+cargo run --locked --bin ev -- approve tasks/hello --reviewer <your-name>
+cargo run --locked --bin ev -- replay tasks/hello
 ```
 
-Planned binaries: `ev` (daily use) and `evengate` (scripts, CI), both built from `src/main.rs`.
+Binaries: `ev` (daily use) and `evengate` (scripts, CI), both built from `src/main.rs`.
+
+Environment: `EVENGATE_SANDBOX_IMAGE`, `EVENGATE_SANDBOX_TIMEOUT_SECS`, `EVENGATE_TEMPLATES`.
 
 ## Working on it
 
