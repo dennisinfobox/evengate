@@ -17,3 +17,6 @@
 {"type":"command_executed","cmd":"git push -q C:\\Users\\Dennis\\source\\repos\\evengate\\tasks\\hello\\artifacts\\remote.git main","exit_code":0,"stdout":"","stderr":""}
 {"type":"command_executed","cmd":"git push -q C:\\Users\\Dennis\\source\\repos\\evengate\\tasks\\hello\\artifacts\\remote.git ev/hello","exit_code":0,"stdout":"","stderr":""}
 {"type":"pr_opened","url":"file:///C:/Users/Dennis/source/repos/evengate/tasks/hello/artifacts/remote.git#ev/hello"}
+{"type":"human_approved","reviewer":"dennis"}
+{"type":"command_executed","cmd":"git rev-parse HEAD","exit_code":0,"stdout":"506bd83ad2ba2e96c3d707e60beca289132446ef\n","stderr":""}
+{"type":"merged","commit":"506bd83ad2ba2e96c3d707e60beca289132446ef"}

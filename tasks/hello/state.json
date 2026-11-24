@@ -1,5 +1,5 @@
 {
-  "phase": "reviewing",
+  "phase": "merged",
   "task_created": true,
   "spec": {
     "title": "hello",
@@ -51,11 +51,14 @@
     "input": 0,
     "output": 0
   },
-  "human_decision": null,
+  "human_decision": {
+    "decision": "approved",
+    "reviewer": "dennis"
+  },
   "agent_invocations": 1,
   "agent_responses": 1,
   "pr_url": "file:///C:/Users/Dennis/source/repos/evengate/tasks/hello/artifacts/remote.git#ev/hello",
-  "merged_commit": null,
+  "merged_commit": "506bd83ad2ba2e96c3d707e60beca289132446ef",
   "abandoned_reason": null,
   "last_tick": null,
   "anomalies": []
