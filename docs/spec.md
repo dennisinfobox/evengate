@@ -1,6 +1,8 @@
-# Evengate — Technical Specification v0.2
+# Evengate — Technical Specification v0.3
 
 > A deterministic, Rust-native software factory that builds and improves itself under human oversight, and later produces pet projects in a familiar way.
+
+**Changes from v0.2:** concurrency settled as post-v1 task-level parallelism (§13.6, ADR-0005); no event-log rework required.
 
 **Changes from v0.1:** the project is now named **Evengate** (event + gate). CLI is `ev` (short) / `evengate` (explicit). Crate and repository are `evengate`. A dedicated Naming section was added. The "event sourcing over reactive streams" principle was made explicit. All `factory`-prefixed identifiers were renamed.
 
@@ -457,17 +459,68 @@ A task is a **self-improvement task** if its spec targets a file under `src/` of
 
 ---
 
-## 13. Open Questions
+## 13. Open Questions and Decisions
 
-To be resolved before Week 3:
+Open design questions keep stable numbers. A resolved question records its answer in place and points to the ADR that settled it; unresolved ones are to be resolved before Week 3.
 
-1. **LLM provider and model per role.** Planning, executing, and reviewing may use different models. Which, and at what budget?
-2. **Sandbox choice on the target platform.** `bwrap` (Linux-only, lightweight) vs `docker` (cross-platform, heavier). Pick one for v0.
-3. **Git hosting.** Local bare repo, GitHub, or self-hosted? Affects `OpenPullRequest` implementation.
-4. **Multi-repo strategy.** One Evengate repo + one repo per produced project? Or a monorepo with subdirectories?
-5. **Human review interface.** Terminal-based (`less` on the PR diff) or web (GitHub/GitLab UI)? v0 assumes terminal + `git diff`.
-6. **Concurrency.** v0 is strictly sequential. When does Evengate need to work on multiple tasks in parallel, and does that require a rework of the event log?
-7. **Domain and public presence.** `evengate.dev` availability, GitHub org name, whether to publish the crate publicly or keep it private. For a personal project, private is fine; if published, reserve the name on crates.io early.
+### 13.1 LLM provider and model per role
+Planning, executing, and reviewing may use different models. Which, and at what budget?
+
+### 13.2 Sandbox choice on the target platform
+`bwrap` (Linux-only, lightweight) vs `docker` (cross-platform, heavier). Pick one for v0.
+
+### 13.3 Git hosting
+Local bare repo, GitHub, or self-hosted? Affects `OpenPullRequest` implementation.
+
+### 13.4 Multi-repo strategy
+One Evengate repo + one repo per produced project? Or a monorepo with subdirectories?
+
+### 13.5 Human review interface
+Terminal-based (`less` on the PR diff) or web (GitHub/GitLab UI)? v0 assumes terminal + `git diff`.
+
+### 13.6 Concurrency
+*Resolved by ADR-0005.*
+
+**v0 is strictly sequential by design.** Parallelism is not needed until
+the human reviewer becomes the bottleneck (typically 3+ tasks in flight
+per day, month 4–6 of the project).
+
+**The per-task event log does not need a rework.** Each task is an
+independent event-sourced aggregate with its own `events.jsonl`, `State`,
+and replay. Parallelism is *embarrassingly parallel at the task level*:
+N tasks run as N independent state machines in N threads, each folding
+its own log. The schemas of `Event`, `State`, `Command`, and the
+signatures of `reduce` and `next_command` are unchanged.
+
+**What parallelism adds is a coordination layer, not a log rework:**
+
+1. A **factory-level event log** (`factory.jsonl` at the repo root)
+   recording cross-task events: `TaskScheduled`, `TaskClaimed`,
+   `TaskStarted`, `TaskFinished`, `BudgetReserved`, `BudgetReleased`.
+   This is a second projection, not a replacement.
+2. **Task claiming** via a file lock (`tasks/<id>/.lock`) or a
+   `TaskClaimed` factory event, so no two workers run the same task.
+3. **A shared budget and rate limiter** behind `Mutex`, reserved per
+   task before `InvokeAgent`.
+4. **Per-task git worktrees** (`git worktree add`) so concurrent tasks
+   never share a working directory.
+
+**No global sequence number is introduced.** Per-task local ordering plus
+wall-clock timestamps plus explicit `TaskDependsOn` events (if and when
+dependencies appear) are sufficient. A global counter would be a
+coordination point without a consumer.
+
+**Cheap intermediate step before building the scheduler:** run two `ev`
+processes in two terminals on two tasks with separate worktrees. If this
+works, the scheduler is pure automation of a proven design. If it breaks,
+the breakage identifies the real coordination points to automate.
+
+**Out of scope for v0 and v1:** two workers on the same task (crash
+recovery), cross-task dependencies, distributed workers. Each of these
+is a separate spec, not a refactor of this one.
+
+### 13.7 Domain and public presence
+`evengate.dev` availability, GitHub org name, whether to publish the crate publicly or keep it private. For a personal project, private is fine; if published, reserve the name on crates.io early.
 
 ---
 

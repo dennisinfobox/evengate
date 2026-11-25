@@ -43,3 +43,10 @@ Decision: `OpenPullRequest` commits the generated project on a branch named `ev/
 Why: The seed kernel must run offline and deterministically. A local bare remote exercises the real git CLI path — branch, commit, push — without credentials, network, or repository-creation APIs.
 Rejected: GitHub API (adds network, tokens, and a repo-creation side effect to the kernel); `git request-pull` files (not a branch that can be reviewed or merged).
 
+## ADR-0005 — Concurrency: task-level parallelism behind a coordination layer
+Date: 2026-11-25
+Status: accepted
+Decision: v0 stays strictly sequential. Future parallelism runs N independent per-task state machines and adds only a coordination layer — a factory-level `factory.jsonl`, task claiming, a shared budget/rate limiter, and per-task git worktrees — leaving `Event`, `State`, `Command`, `reduce`, and `next_command` unchanged.
+Why: Each task is already an independent event-sourced aggregate with its own log and replay, so the existing design parallelizes at the task boundary without touching schemas. A global sequence number would be a coordination point with no consumer; per-task order, wall-clock timestamps, and explicit `TaskDependsOn` events suffice. Building the scheduler before two `ev` processes run in two worktrees would automate an unproven design.
+Rejected: Global event log or sequence number (serializes independent tasks, no consumer); reworking per-task logs (unnecessary); scheduling two workers on one task, cross-task dependencies, and distributed workers (each is a separate spec, out of scope for v0 and v1).
+

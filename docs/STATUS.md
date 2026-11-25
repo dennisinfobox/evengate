@@ -1,6 +1,6 @@
 # Status
 
-Last updated: 2026-11-24
+Last updated: 2026-11-25
 
 **Phase:** 1 — First tasks (week 3–4). Phase 0 exit criterion met: one task ran end to end, the PR was opened by the git CLI, and a human merged it.
 
@@ -11,6 +11,7 @@ Last updated: 2026-11-24
 - `ev replay tasks/hello` reproduces `state.json` byte-identically (22 events, no anomalies).
 - `cargo check --locked`, `cargo test --locked` (25 tests), `cargo clippy --locked -- -D warnings` pass on the pinned 1.100.0 toolchain.
 - Sandbox image `evengate-sandbox:1.100` defined in `sandbox/Dockerfile` (adds clippy and rustfmt, runs with `--network=none`).
+- Concurrency settled by ADR-0005: v0 stays sequential; future parallelism is task-level with a coordination layer, no event-log rework. Spec §13.6 records it; spec bumped to v0.3.
 
 **In flight:** nothing.
 
@@ -21,4 +22,4 @@ Last updated: 2026-11-24
 
 **Blockers:** none.
 
-**Open questions:** `docs/spec.md` §13 items 1, 5, 6, 7 remain open; item 2 is settled by ADR-0003, item 3 for v0 by ADR-0004.
+**Open questions:** `docs/spec.md` §13 items 1, 4, 5, 7 remain open; item 2 is settled by ADR-0003, item 3 for v0 by ADR-0004, item 6 by ADR-0005.
