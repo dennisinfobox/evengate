@@ -18,6 +18,17 @@ pub const MAX_TOTAL_BYTES: usize = 8 * 1024 * 1024;
 const SYSTEM_PROMPT: &str = "You are the executing agent of the Evengate software factory. \
 You return complete, compilable projects. You never ask questions and never wrap the result in prose.";
 
+const REVIEWER_SYSTEM_PROMPT: &str = "You are the review agent of the Evengate software factory. \
+You inspect a complete project against its task specification and return a strict JSON verdict. \
+You never edit files, never ask questions, and never wrap the result in prose.";
+
+fn system_prompt(role: AgentRole) -> &'static str {
+    match role {
+        AgentRole::Reviewer => REVIEWER_SYSTEM_PROMPT,
+        AgentRole::Planner | AgentRole::Executor => SYSTEM_PROMPT,
+    }
+}
+
 /// One request to a model. The prompt is the only recorded input; its hash is
 /// what `AgentInvoked` stores and what `RecordedClient` matches against.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,7 +103,7 @@ impl FileManifest {
     }
 }
 
-fn strip_fence(text: &str) -> &str {
+pub(crate) fn strip_fence(text: &str) -> &str {
     let text = text.trim();
     let Some(rest) = text.strip_prefix("```") else {
         return text;
@@ -298,7 +309,7 @@ impl LlmClient for LiveClient {
             messages: vec![
                 ChatMessageIn {
                     role: "system",
-                    content: SYSTEM_PROMPT,
+                    content: system_prompt(request.role),
                 },
                 ChatMessageIn {
                     role: "user",

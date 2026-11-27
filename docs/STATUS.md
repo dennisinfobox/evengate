@@ -2,26 +2,25 @@
 
 Last updated: 2026-11-27
 
-**Phase:** 1 — First tasks (week 3–4). Deterministic gates, sandbox, PR flow, and replay are done; the LLM boundary is implemented and awaits a first live run.
+**Phase:** 1 — First tasks (week 5–6). The deterministic gates and the LLM-backed review gate now form one pipeline; human approval remains the final gate.
 
 **Done since last handoff:**
-- New `src/llm.rs`: `LlmClient` trait, `LlmRequest`/`LlmResponse`, prompt hashing, and the JSON file-manifest agent protocol (`{"files": {path: contents}}`).
-- `LiveClient` posts OpenAI-compatible chat completions over blocking `ureq`: per-role model, bearer key, timeout, token cap, capped error bodies. Tested against a local HTTP stub for request shape, auth, usage, and non-2xx handling.
-- `RecordedClient` rebuilds `AgentInvoked`/`AgentResponded` pairs from the log and refuses role/prompt-hash mismatches.
-- `TemplateClient` renders `templates/` into the same manifest and stays the offline default.
-- `executor::InvokeAgent` builds a deterministic prompt from the full spec plus the template, calls the selected client, validates and applies the manifest to `project/`, then records the raw response and token usage.
-- Selection: `EVENGATE_LLM=template|live|recorded`; `EVENGATE_LLM_URL` implies `live`. Every other command works without LLM configuration.
-- Spec bumped to v0.4 (§7.5, §9, §13.1); ADR-0006 recorded; README documents the environment.
-- Checks pass: `cargo check --locked`, `cargo test --locked` (37 tests), `cargo clippy --locked -- -D warnings`. An offline scratch task ran through all three gates and opened a PR; `ev replay` reproduced `state.json` byte-identically (19 events).
+- `ReviewAgent` is the fourth mandatory gate (`gate::MANDATORY_V0`), after `Compiles`, `TestsPass`, and `LintsClean`.
+- It reviews the real project tree (full spec + all text files, `.git`/`target` excluded, sorted, 256 KiB per-file cap) using the `Reviewer` role, records `AgentInvoked`/`AgentResponded` with token usage, and maps `{approve, issues[]}` to `Pass`/`Fail`. A malformed verdict becomes `NeedsHuman`, never a pass.
+- A withheld approval stops the run immediately with the issues as the fail reason; the same artifact is never re-sent to the reviewer. The reducer accepts reviewer turns during `Verifying` without anomalies while executor turns stay phase-checked.
+- Offline template mode cannot pass the review gate: it stops there with an actionable error, and the task resumes at that gate once a model is configured.
+- Spec bumped to v0.5 (§7.6); ADR-0007 recorded; README explains the mandatory review.
+- Checks pass: `cargo check --locked`, `cargo test --locked` (47 tests), `cargo clippy --locked -- -D warnings`.
+- End-to-end against a local OpenAI-compatible stub: approve → 4 gates pass → PR opened; reject → review `Fail` with reason, no PR; offline run → review error → resume with the model → PR. Both logs replay byte-identically (22 and 12 events). Token usage recorded for both roles.
 
 **In flight:** nothing.
 
 **Next:**
-1. Run one task with a real OpenAI-compatible endpoint and land the first model-authored project (needs `EVENGATE_LLM_URL`/key/model in the environment).
-2. `ReviewAgent` gate (LLM-backed, recorded) after the deterministic gates.
-3. Sandbox hardening: confirm the copy-in/copy-out contract and timeout behaviour under failure.
-4. If a checked-out task must rebuild its gitignored `project/` from the log, add an execution replay path; `ev replay` is currently a state-only fold, so `EVENGATE_LLM=recorded` has no CLI flow yet.
+1. Gate-failure recovery: a rejected review (or any gate failing after retries) stops at `RequestHumanReview` with no command path to revise or abandon. Needs a revision phase that re-invokes the executor with the failure reasons.
+2. `knowledge.rs`: write `lessons/<task>.md` after a task and feed the most recent lessons into the next prompt (the rest of week 5–6).
+3. Run one task against a real OpenAI-compatible endpoint and land the first model-authored project.
+4. Sandbox hardening; an execution replay path to rebuild a gitignored `project/` from the log.
 
 **Blockers:** none.
 
-**Open questions:** `docs/spec.md` §13 items 1, 4, 5, 7 remain open; §13.1's provider/budget choice is configuration after ADR-0006, which settled the wire format. Item 2 is settled by ADR-0003, item 3 by ADR-0004, item 6 by ADR-0005.
+**Open questions:** `docs/spec.md` §13 items 1, 4, 5, 7 remain open; §13.1's provider/budget choice is configuration after ADR-0006. Item 2 is settled by ADR-0003, item 3 by ADR-0004, item 6 by ADR-0005.

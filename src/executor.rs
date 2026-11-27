@@ -1,10 +1,11 @@
+use std::collections::BTreeMap;
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command as Process;
 
-use crate::event::{AgentRole, Event, GateId};
+use crate::event::{AgentRole, Event, GateId, GateResult};
 use crate::gate;
 use crate::llm::{self, FileManifest, LiveClient, LlmClient, LlmRequest, RecordedClient, TemplateClient};
 use crate::machine::{Command, Context, Outcome};
@@ -13,6 +14,8 @@ use crate::spec::{self, Spec};
 
 const COMMIT_NAME: &str = "Evengate";
 const COMMIT_EMAIL: &str = "evengate@localhost";
+const REVIEW_FILE_CAP: usize = 256 * 1024;
+const REVIEW_SKIP_DIRS: [&str; 2] = [".git", "target"];
 
 /// Everything the impure boundary needs. The executor never mutates `State`.
 pub struct ExecCtx {
@@ -20,6 +23,7 @@ pub struct ExecCtx {
     pub project_name: String,
     pub title: String,
     pub templates_dir: PathBuf,
+    context: Context,
 }
 
 impl ExecCtx {
@@ -32,6 +36,7 @@ impl ExecCtx {
             project_name: spec::slug(&spec.title),
             title: spec.title.clone(),
             templates_dir,
+            context: Context::from_spec(spec),
         }
     }
 
@@ -77,12 +82,16 @@ fn client_mode() -> Result<ClientMode, String> {
     }
 }
 
-fn client_for(ctx: &ExecCtx) -> Result<Box<dyn LlmClient>, String> {
+fn client_for(ctx: &ExecCtx, role: AgentRole) -> Result<Box<dyn LlmClient>, String> {
     match client_mode()? {
-        ClientMode::Template => Ok(Box::new(TemplateClient::new(
+        ClientMode::Template if role != AgentRole::Reviewer => Ok(Box::new(TemplateClient::new(
             ctx.templates_dir.clone(),
             ctx.project_name.clone(),
         ))),
+        ClientMode::Template => Err(
+            "the review gate requires a model: set EVENGATE_LLM_URL (or EVENGATE_LLM=recorded with a recorded verdict)"
+                .into(),
+        ),
         ClientMode::Live => Ok(Box::new(LiveClient::from_env()?)),
         ClientMode::Recorded => {
             let events = crate::log::read_events(&ctx.task_dir)
@@ -99,7 +108,7 @@ fn invoke_agent(
 ) -> Result<Vec<Event>, String> {
     let prompt = build_prompt(context, &ctx.templates_dir)?;
     let request = LlmRequest { role, prompt };
-    let client = client_for(ctx)?;
+    let client = client_for(ctx, role)?;
     let response = client.complete(&request)?;
     let manifest = FileManifest::parse(&response.text)?;
     apply_manifest(&manifest, &ctx.project_dir())?;
@@ -121,14 +130,7 @@ fn invoke_agent(
 fn build_prompt(context: &Context, templates: &Path) -> Result<String, String> {
     let mut prompt = String::new();
     prompt.push_str("Build the complete project described below.\n");
-    let _ = writeln!(prompt, "\n# Task\nTitle: {}", context.title);
-    let _ = writeln!(prompt, "Project: {}", context.project);
-    let _ = writeln!(prompt, "\n## Goal\n{}", context.goal.trim());
-    push_list(&mut prompt, "Acceptance", &context.acceptance);
-    push_list(&mut prompt, "Constraints", &context.constraints);
-    push_list(&mut prompt, "Non-goals", &context.non_goals);
-    push_list(&mut prompt, "Context", &context.context);
-    push_list(&mut prompt, "Open questions", &context.open_questions);
+    push_task_spec(&mut prompt, context);
 
     if templates.is_dir() {
         let files = llm::read_template_files(templates, &context.project)?;
@@ -148,6 +150,92 @@ fn build_prompt(context: &Context, templates: &Path) -> Result<String, String> {
          Every path must be relative, use `/`, and contain no `..`. Include every file the project needs.\n",
     );
     Ok(prompt)
+}
+
+/// The reviewer sees the real artifact the deterministic gates approved, not
+/// the executing agent's summary of it.
+fn build_review_prompt(context: &Context, project: &Path) -> Result<String, String> {
+    let mut prompt =
+        String::from("Review the complete project below before it is offered to the human owner.\n");
+    push_task_spec(&mut prompt, context);
+    let files = read_project_files(project)?;
+    prompt.push_str("\n# Project files\n");
+    for (path, content) in files {
+        let _ = writeln!(prompt, "\n--- {path} ---\n{content}");
+    }
+    prompt.push_str(
+        "\n# Output\nReturn one JSON object and nothing else:\n\
+         {\"approve\": true, \"issues\": []}\n\
+         Set `approve` to false and list concrete, actionable issues when the project does not satisfy its acceptance criteria or violates a constraint. Review the code, not the process.\n",
+    );
+    Ok(prompt)
+}
+
+fn push_task_spec(prompt: &mut String, context: &Context) {
+    let _ = writeln!(prompt, "\n# Task\nTitle: {}", context.title);
+    let _ = writeln!(prompt, "Project: {}", context.project);
+    let _ = writeln!(prompt, "\n## Goal\n{}", context.goal.trim());
+    push_list(prompt, "Acceptance", &context.acceptance);
+    push_list(prompt, "Constraints", &context.constraints);
+    push_list(prompt, "Non-goals", &context.non_goals);
+    push_list(prompt, "Context", &context.context);
+    push_list(prompt, "Open questions", &context.open_questions);
+}
+
+/// Text files of the project in sorted path order. VCS and build output are
+/// excluded so the review prompt is stable across runs.
+fn read_project_files(project: &Path) -> Result<BTreeMap<String, String>, String> {
+    if !project.is_dir() {
+        return Err(format!("project directory missing: {}", project.display()));
+    }
+    let mut files = BTreeMap::new();
+    collect_project(project, Path::new(""), &mut files)?;
+    Ok(files)
+}
+
+fn collect_project(
+    dir: &Path,
+    rel: &Path,
+    files: &mut BTreeMap<String, String>,
+) -> Result<(), String> {
+    let entries = fs::read_dir(dir).map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
+    let mut entries = entries
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let path = entry.path();
+        let file_name = entry.file_name();
+        let file_type = entry
+            .file_type()
+            .map_err(|e| format!("cannot stat {}: {e}", path.display()))?;
+        if file_type.is_dir() {
+            if REVIEW_SKIP_DIRS.contains(&file_name.to_string_lossy().as_ref()) {
+                continue;
+            }
+            collect_project(&path, &rel.join(&file_name), files)?;
+        } else if file_type.is_file() {
+            let text = fs::read_to_string(&path)
+                .map_err(|e| format!("cannot read {} for review: {e}", path.display()))?;
+            if text.len() > REVIEW_FILE_CAP {
+                return Err(format!(
+                    "review input too large: {} is {} bytes (max {REVIEW_FILE_CAP})",
+                    path.display(),
+                    text.len()
+                ));
+            }
+            files.insert(
+                rel.join(&file_name).to_string_lossy().replace('\\', "/"),
+                text,
+            );
+        } else {
+            return Err(format!(
+                "project entry is not a file or directory: {}",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn push_list(prompt: &mut String, title: &str, items: &[String]) {
@@ -181,6 +269,9 @@ fn apply_manifest(manifest: &FileManifest, dst: &Path) -> Result<usize, String> 
 }
 
 fn run_gate(gate_id: GateId, ctx: &ExecCtx) -> Result<Vec<Event>, String> {
+    if gate_id == GateId::ReviewAgent {
+        return run_review_gate(ctx);
+    }
     let argv = gate::command(gate_id)
         .ok_or_else(|| format!("gate {} has no deterministic command in v0", gate::slug(gate_id)))?;
     let project = ctx.project_dir();
@@ -210,6 +301,39 @@ fn run_gate(gate_id: GateId, ctx: &ExecCtx) -> Result<Vec<Event>, String> {
         },
         Event::GateEvaluated {
             gate: gate_id,
+            result,
+        },
+    ])
+}
+
+/// LLM-backed gate. The model's raw verdict is recorded as a `Reviewer`
+/// response; an unusable answer becomes `NeedsHuman`, never a pass.
+fn run_review_gate(ctx: &ExecCtx) -> Result<Vec<Event>, String> {
+    let prompt = build_review_prompt(&ctx.context, &ctx.project_dir())?;
+    let request = LlmRequest {
+        role: AgentRole::Reviewer,
+        prompt,
+    };
+    let client = client_for(ctx, AgentRole::Reviewer)?;
+    let response = client.complete(&request)?;
+    let result = match gate::evaluate_review(&response.text) {
+        Ok(result) => result,
+        Err(error) => GateResult::NeedsHuman {
+            question: format!("review agent returned an unusable verdict: {error}"),
+        },
+    };
+    Ok(vec![
+        Event::AgentInvoked {
+            role: AgentRole::Reviewer,
+            prompt_hash: request.prompt_hash(),
+        },
+        Event::AgentResponded {
+            role: AgentRole::Reviewer,
+            response: response.text,
+            tokens: response.tokens,
+        },
+        Event::GateEvaluated {
+            gate: GateId::ReviewAgent,
             result,
         },
     ])
@@ -440,6 +564,40 @@ mod tests {
         assert!(apply_manifest(&FileManifest { files }, &project).is_err());
         assert!(project.join("keep.txt").exists());
         assert!(!root.join("escape.txt").exists());
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn review_prompt_reads_the_project_and_skips_vcs_and_target() {
+        let root = env::temp_dir().join(format!("evengate-review-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let project = root.join("project");
+        fs::create_dir_all(project.join("src")).unwrap();
+        fs::create_dir_all(project.join(".git")).unwrap();
+        fs::create_dir_all(project.join("target/debug")).unwrap();
+        fs::write(project.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        fs::write(project.join("src/main.rs"), "fn main() {}\n").unwrap();
+        fs::write(project.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::write(project.join("target/debug/junk"), "junk").unwrap();
+
+        let context = Context {
+            project: "hello".into(),
+            title: "Hello".into(),
+            goal: "make a crate".into(),
+            acceptance: vec!["it compiles".into()],
+            constraints: Vec::new(),
+            non_goals: Vec::new(),
+            context: Vec::new(),
+            open_questions: Vec::new(),
+        };
+        let prompt = build_review_prompt(&context, &project).unwrap();
+        assert!(prompt.contains("--- src/main.rs ---\nfn main() {}"));
+        assert!(prompt.contains("--- Cargo.toml ---"));
+        assert!(!prompt.contains(".git/HEAD"));
+        assert!(!prompt.contains("target/debug/junk"));
+        assert!(prompt.contains("\"approve\""));
+        assert_eq!(prompt, build_review_prompt(&context, &project).unwrap());
 
         fs::remove_dir_all(&root).unwrap();
     }

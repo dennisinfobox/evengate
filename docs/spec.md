@@ -1,6 +1,8 @@
-# Evengate — Technical Specification v0.4
+# Evengate — Technical Specification v0.5
 
 > A deterministic, Rust-native software factory that builds and improves itself under human oversight, and later produces pet projects in a familiar way.
+
+**Changes from v0.4:** the `ReviewAgent` gate is mandatory and LLM-backed; it reviews the project tree after the deterministic gates and stops for a human when approval is withheld (§7.6, ADR-0007).
 
 **Changes from v0.3:** the model boundary is concrete — a JSON file-manifest agent protocol, an OpenAI-compatible `LiveClient` over `ureq`, a prompt-hash-checked `RecordedClient`, and the offline `TemplateClient` as the default (§7.5, ADR-0006).
 
@@ -294,10 +296,12 @@ pub trait Gate {
 | `Compiles` | Deterministic | `cargo check --locked` in sandbox, exit 0 |
 | `TestsPass` | Deterministic | `cargo test --locked`, all green |
 | `LintsClean` | Deterministic | `cargo clippy --locked -- -D warnings` |
-| `ReviewAgent` | LLM (recorded) | Diff → structured verdict `{approve, issues[]}` |
+| `ReviewAgent` | LLM (recorded) | Project tree (path → contents) → structured verdict `{approve: bool, issues: []}` |
 | `HumanApproval` | Human | Explicit `HumanApproved` event |
 
 **Rule:** the executing agent has no mechanism to mark a gate as passed. Gates own their verdicts.
+
+`Compiles`, `TestsPass`, `LintsClean`, and `ReviewAgent` are the mandatory v0 gates, in that order. The review agent runs on the artifact the deterministic gates accepted, records its request and raw response as `Reviewer` events, and maps a withheld approval to `Fail` with the issues as the reason. A rejection stops the run for a human immediately rather than re-asking the same tree; an unusable verdict becomes `NeedsHuman`. Review requires a model: with the offline `TemplateClient` the run stops at this gate with an actionable error and resumes once a model is configured. The executor cannot pass this gate on the reviewer's behalf.
 
 ### 7.7 `sandbox.rs` — process isolation
 

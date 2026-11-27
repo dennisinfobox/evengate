@@ -92,7 +92,12 @@ pub fn next_command(state: &State) -> Option<Command> {
                     Some(GateResult::NeedsHuman { .. }) => return Some(review_command()),
                     Some(GateResult::Fail { .. }) => {
                         let attempts = state.gate_attempts.get(&gate_id).copied().unwrap_or(0);
-                        return if attempts >= MAX_GATE_ATTEMPTS {
+                        // A review failure is a verdict about the artifact, not
+                        // a flaky check; re-asking the same tree only burns
+                        // tokens. Stop for a human on the first rejection.
+                        return if gate_id == GateId::ReviewAgent
+                            || attempts >= MAX_GATE_ATTEMPTS
+                        {
                             Some(review_command())
                         } else {
                             Some(Command::RunGate { gate: gate_id })
@@ -180,6 +185,49 @@ mod tests {
             );
         }
         state
+    }
+
+    fn with_deterministic_passes(mut state: State) -> State {
+        for id in [GateId::Compiles, GateId::TestsPass, GateId::LintsClean] {
+            state = reduce(
+                state,
+                &Event::GateEvaluated {
+                    gate: id,
+                    result: GateResult::Pass,
+                },
+            );
+        }
+        state
+    }
+
+    #[test]
+    fn review_runs_after_the_deterministic_gates() {
+        let state = with_deterministic_passes(generated());
+        assert_eq!(
+            next_command(&state),
+            Some(Command::RunGate {
+                gate: GateId::ReviewAgent
+            })
+        );
+    }
+
+    #[test]
+    fn one_review_failure_stops_without_retrying() {
+        let state = with_deterministic_passes(generated());
+        let state = reduce(
+            state,
+            &Event::GateEvaluated {
+                gate: GateId::ReviewAgent,
+                result: GateResult::Fail {
+                    reason: "missing tests".into(),
+                },
+            },
+        );
+        assert_eq!(state.gate_attempts[&GateId::ReviewAgent], 1);
+        assert!(matches!(
+            next_command(&state),
+            Some(Command::RequestHumanReview { .. })
+        ));
     }
 
     #[test]

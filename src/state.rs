@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::event::{Event, GateId, GateResult, TokenUsage};
+use crate::event::{AgentRole, Event, GateId, GateResult, TokenUsage};
 use crate::gate;
 use crate::spec::Spec;
 
@@ -99,30 +99,37 @@ pub fn reduce(mut state: State, event: &Event) -> State {
                 state.task_created = true;
             }
         }
-        Event::AgentInvoked { .. } => {
+        Event::AgentInvoked { role, .. } => {
             if !state.task_created {
                 anomaly(&mut state, "agent_invoked before task_created");
             }
             state.agent_invocations = state.agent_invocations.saturating_add(1);
-            if state.phase == Phase::Drafting {
-                state.phase = Phase::Generating;
-            } else {
-                anomaly(&mut state, "agent_invoked outside drafting");
+            match (state.phase, *role) {
+                (Phase::Drafting, AgentRole::Executor) => state.phase = Phase::Generating,
+                (Phase::Verifying, AgentRole::Reviewer) => {}
+                _ => anomaly(&mut state, "agent_invoked outside its phase"),
             }
         }
-        Event::AgentResponded { tokens, .. } => {
-            if state.phase != Phase::Generating {
-                anomaly(&mut state, "agent_responded outside generating");
-            }
+        Event::AgentResponded {
+            role,
+            tokens,
+            ..
+        } => {
             state.agent_responses = state.agent_responses.saturating_add(1);
             state.token_spend.add(*tokens);
-            if !state.artifacts.iter().any(|a| a.path == "project") {
-                state.artifacts.push(ArtifactRef {
-                    path: "project".into(),
-                    kind: "tree".into(),
-                });
+            match (state.phase, *role) {
+                (Phase::Generating, AgentRole::Executor) => {
+                    if !state.artifacts.iter().any(|a| a.path == "project") {
+                        state.artifacts.push(ArtifactRef {
+                            path: "project".into(),
+                            kind: "tree".into(),
+                        });
+                    }
+                    state.phase = Phase::Verifying;
+                }
+                (Phase::Verifying, AgentRole::Reviewer) => {}
+                _ => anomaly(&mut state, "agent_responded outside its phase"),
             }
-            state.phase = Phase::Verifying;
         }
         Event::CommandExecuted { .. } => {
             if !state.task_created {
@@ -261,5 +268,72 @@ mod tests {
         let state = reduce(state, &Event::AgentResponded { role: crate::event::AgentRole::Executor, response: "r".into(), tokens });
         assert_eq!(state.token_spend, TokenUsage { input: 2, output: 3 });
         assert_eq!(state.phase, Phase::Verifying);
+    }
+
+    #[test]
+    fn reviewer_turns_in_verification_are_not_anomalies() {
+        let state = reduce(
+            created(),
+            &Event::AgentInvoked {
+                role: AgentRole::Executor,
+                prompt_hash: "0".into(),
+            },
+        );
+        let state = reduce(
+            state,
+            &Event::AgentResponded {
+                role: AgentRole::Executor,
+                response: "r".into(),
+                tokens: TokenUsage::default(),
+            },
+        );
+        let state = reduce(
+            state,
+            &Event::AgentInvoked {
+                role: AgentRole::Reviewer,
+                prompt_hash: "1".into(),
+            },
+        );
+        let state = reduce(
+            state,
+            &Event::AgentResponded {
+                role: AgentRole::Reviewer,
+                response: "{\"approve\":true}".into(),
+                tokens: TokenUsage { input: 5, output: 1 },
+            },
+        );
+        assert!(state.anomalies.is_empty(), "{:?}", state.anomalies);
+        assert_eq!(state.phase, Phase::Verifying);
+        assert_eq!(state.agent_invocations, 2);
+        assert_eq!(state.agent_responses, 2);
+        assert_eq!(state.token_spend, TokenUsage { input: 5, output: 1 });
+    }
+
+    #[test]
+    fn executor_turns_in_verification_are_anomalies() {
+        let state = reduce(
+            created(),
+            &Event::AgentInvoked {
+                role: AgentRole::Executor,
+                prompt_hash: "0".into(),
+            },
+        );
+        let state = reduce(
+            state,
+            &Event::AgentResponded {
+                role: AgentRole::Executor,
+                response: "r".into(),
+                tokens: TokenUsage::default(),
+            },
+        );
+        let state = reduce(
+            state,
+            &Event::AgentInvoked {
+                role: AgentRole::Executor,
+                prompt_hash: "1".into(),
+            },
+        );
+        assert_eq!(state.anomalies.len(), 1);
+        assert!(state.anomalies[0].contains("outside its phase"));
     }
 }
