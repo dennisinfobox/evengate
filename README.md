@@ -4,13 +4,13 @@ A deterministic, Rust-native software factory that builds and improves itself un
 
 **Evengate** = *event* + *gate*: all state is derived from an append-only event log, and nothing moves without passing a gate.
 
-Status: seed kernel works for one scenario — generate a crate from `templates/bin/`, gate it, open a pull request. See `docs/STATUS.md`.
+Status: phase 1 — the first model-authored project is merged, review lessons feed the next prompt, and a lesson repeated across three tasks pauses for human promotion. See `docs/STATUS.md`.
 
 ## Documentation
 
 | File | Purpose |
 |---|---|
-| [`docs/spec.md`](docs/spec.md) | Authoritative design, v0.9 |
+| [`docs/spec.md`](docs/spec.md) | Authoritative design, v0.13 |
 | [`docs/STATUS.md`](docs/STATUS.md) | Current phase, next step, blockers |
 | [`docs/DECISIONS.md`](docs/DECISIONS.md) | Decision log with rationale |
 | [`AGENTS.md`](AGENTS.md) | Rules for agents and contributors |
@@ -21,22 +21,26 @@ Status: seed kernel works for one scenario — generate a crate from `templates/
 docker build -t evengate-sandbox:1.100 sandbox   # once: clippy + rustfmt inside
 cargo build --locked
 
-cargo run --locked --bin ev -- run tasks/hello/spec.md
-cargo run --locked --bin ev -- replay tasks/hello
-cargo run --locked --bin ev -- materialize tasks/hello   # rebuild project/ from the log
+# start or resume a task; every task directory carries its own spec.md
+cargo run --locked --bin ev -- run tasks/<task-dir>/spec.md
+
+# verify recorded state and rebuild derived artifacts
+cargo run --locked --bin ev -- replay tasks/sum-cli
+cargo run --locked --bin ev -- materialize tasks/sum-cli
 
 # after reviewing the branch:
-cargo run --locked --bin ev -- approve tasks/hello --reviewer <your-name>
-cargo run --locked --bin ev -- replay tasks/hello
+cargo run --locked --bin ev -- approve <task-dir> --reviewer <your-name>
 
 # when a gate blocks the task:
-cargo run --locked --bin ev -- revise tasks/hello --reviewer <your-name> --reason "fix the failing test"
-cargo run --locked --bin ev -- abandon tasks/hello --reviewer <your-name> --reason "not worth finishing"
+cargo run --locked --bin ev -- revise <task-dir> --reviewer <your-name> --reason "fix the failing test"
+cargo run --locked --bin ev -- abandon <task-dir> --reviewer <your-name> --reason "not worth finishing"
 
 # when a repeated lesson is proposed:
-cargo run --locked --bin ev -- promote tasks/hello --reviewer <your-name>
-cargo run --locked --bin ev -- dismiss tasks/hello --reviewer <your-name>
+cargo run --locked --bin ev -- promote <task-dir> --reviewer <your-name>
+cargo run --locked --bin ev -- dismiss <task-dir> --reviewer <your-name>
 ```
+
+`tasks/hello` is the frozen seed-kernel run. It predates the mandatory review gate, so `ev replay tasks/hello` intentionally reports a pre-gate anomaly instead of matching its snapshot (ADR-0015).
 
 Binaries: `ev` (daily use) and `evengate` (scripts, CI), both built from `src/main.rs`.
 

@@ -1,6 +1,8 @@
-# Evengate — Technical Specification v0.12
+# Evengate — Technical Specification v0.13
 
 > A deterministic, Rust-native software factory that builds and improves itself under human oversight, and later produces pet projects in a familiar way.
+
+**Changes from v0.12:** the replay guarantee is scoped to the reducer that produced the snapshot; `tasks/hello` is frozen as seed-run evidence and is expected to replay with the pre-`ReviewAgent` anomaly (§6.3, §14, ADR-0015).
 
 **Changes from v0.11:** a lesson seen in three tasks now pauses the task before its PR; `ev promote` adds it to `rules/`, `ev dismiss` declines for that task (§7.8, ADR-0014).
 
@@ -157,7 +159,7 @@ tasks/<task-id>/
   artifacts/      -- produced files, patches, logs
 ```
 
-**Replay guarantee:** `ev replay <task-id>` reads `events.jsonl`, folds through `reduce`, and produces a `State` identical to the live run. Live LLM responses are recorded as events, so replay never calls the network.
+**Replay guarantee:** `ev replay <task-id>` reads `events.jsonl`, folds through `reduce`, and produces a `State` identical to the live run when the snapshot was written by the same reducer. Live LLM responses are recorded as events, so replay never calls the network. The guarantee is about determinism, not backward compatibility: when the gate set or reducer changes, replaying an older log records the resulting anomaly and reports the snapshot mismatch instead of rewriting history. `tasks/hello` is such a frozen snapshot (§14, ADR-0015).
 
 **Execution replay:** `ev materialize <task-id>` reconstructs the gitignored `project/` tree and `lessons/<task-id>.md` from `AgentResponded` events in log order. The last executor manifest wins; the last usable reviewer verdict supplies the lesson. It calls no model, spawns nothing, and leaves `state.json` untouched, so the pure-fold guarantee of `ev replay` is unchanged. Only recorded files are recreated: a local `.git` or `target/` inside `project/` is dropped, and the bare remote under `artifacts/` is untouched.
 
@@ -606,7 +608,7 @@ No LLM. No knowledge. No review agent. Just the state machine, the event log, th
 
 1. `ev run tasks/hello/spec.md` executes the scenario end-to-end without human input until the PR is opened.
 2. `events.jsonl` contains a complete, ordered record of every step.
-3. `ev replay tasks/hello` reconstructs a `state.json` byte-identical to the live run, with no network calls.
+3. `ev replay tasks/hello` reconstructed a `state.json` byte-identical to the live run under the seed-kernel reducer, with no network calls. The snapshot is now frozen historical evidence: under the current mandatory gate set it replays with the `merged without passed gates and human approval` anomaly (§6.3, ADR-0015).
 4. `cargo check --locked`, `cargo test --locked`, and `cargo clippy --locked -- -D warnings` all pass on Evengate itself.
 5. The produced `hello` crate passes the same three checks inside the sandbox.
 6. You merge the PR by hand. That merge is the first `HumanApproved` event in Evengate's history — and the moment the name becomes true: work moved through events and gates, and nothing moved without passing a gate.
