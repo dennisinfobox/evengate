@@ -1,5 +1,5 @@
 {
-  "phase": "verifying",
+  "phase": "reviewing",
   "task_created": true,
   "spec": {
     "title": "Sum CLI",
@@ -71,7 +71,7 @@
   "human_decision": null,
   "agent_invocations": 4,
   "agent_responses": 4,
-  "pr_url": null,
+  "pr_url": "file:///C:/Users/Dennis/source/repos/evengate/tasks/sum-cli-help/artifacts/remote.git#ev/sum-cli",
   "merged_commit": null,
   "abandoned_reason": null,
   "last_tick": null,
@@ -93,5 +93,11 @@
       "text": "Unit tests are crucial for validating both valid and invalid inputs.",
       "count": 3
     }
+  },
+  "promotion_decisions": {
+    "handling edge cases, such as very large or small numbers, can enhance the robustness of the application.": "promoted",
+    "keep the dependencies minimal to adhere to the constraints.": "dismissed",
+    "remember to use `cargo clippy` to catch potential warnings and improve code quality.": "dismissed",
+    "unit tests are crucial for validating both valid and invalid inputs.": "dismissed"
   }
 }
