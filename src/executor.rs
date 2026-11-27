@@ -7,6 +7,7 @@ use std::process::Command as Process;
 
 use crate::event::{AgentRole, Event, GateId, GateResult};
 use crate::gate;
+use crate::knowledge::{self, Lesson};
 use crate::llm::{self, FileManifest, LiveClient, LlmClient, LlmRequest, RecordedClient, TemplateClient};
 use crate::machine::{Command, Context, Outcome};
 use crate::sandbox::{self, RunOutput, Sandbox};
@@ -23,6 +24,8 @@ pub struct ExecCtx {
     pub project_name: String,
     pub title: String,
     pub templates_dir: PathBuf,
+    pub lessons_dir: PathBuf,
+    task_id: String,
     context: Context,
 }
 
@@ -31,11 +34,20 @@ impl ExecCtx {
         let templates_dir = env::var("EVENGATE_TEMPLATES")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("templates/bin"));
+        let lessons_dir = env::var("EVENGATE_LESSONS_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("lessons"));
+        let task_id = task_dir
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| spec::slug(&spec.title));
         ExecCtx {
             task_dir: task_dir.to_path_buf(),
             project_name: spec::slug(&spec.title),
             title: spec.title.clone(),
             templates_dir,
+            lessons_dir,
+            task_id,
             context: Context::from_spec(spec),
         }
     }
@@ -106,7 +118,8 @@ fn invoke_agent(
     context: &Context,
     ctx: &ExecCtx,
 ) -> Result<Vec<Event>, String> {
-    let prompt = build_prompt(context, &ctx.templates_dir)?;
+    let lessons = knowledge::recent_lessons(&ctx.lessons_dir, knowledge::RECENT_LESSONS)?;
+    let prompt = build_prompt(context, &ctx.templates_dir, &lessons)?;
     let request = LlmRequest { role, prompt };
     let client = client_for(ctx, role)?;
     let response = client.complete(&request)?;
@@ -127,7 +140,7 @@ fn invoke_agent(
 
 /// Deterministic prompt assembly. The template is included so a live agent
 /// has the same source material the offline template client renders.
-fn build_prompt(context: &Context, templates: &Path) -> Result<String, String> {
+fn build_prompt(context: &Context, templates: &Path, lessons: &[Lesson]) -> Result<String, String> {
     let mut prompt = String::new();
     if context.feedback.is_empty() {
         prompt.push_str("Build the complete project described below.\n");
@@ -138,6 +151,7 @@ fn build_prompt(context: &Context, templates: &Path) -> Result<String, String> {
     }
     push_task_spec(&mut prompt, context);
     push_list(&mut prompt, "Revision feedback", &context.feedback);
+    prompt.push_str(&knowledge::prompt_section(lessons));
 
     if templates.is_dir() {
         let files = llm::read_template_files(templates, &context.project)?;
@@ -172,8 +186,9 @@ fn build_review_prompt(context: &Context, project: &Path) -> Result<String, Stri
     }
     prompt.push_str(
         "\n# Output\nReturn one JSON object and nothing else:\n\
-         {\"approve\": true, \"issues\": []}\n\
-         Set `approve` to false and list concrete, actionable issues when the project does not satisfy its acceptance criteria or violates a constraint. Review the code, not the process.\n",
+         {\"approve\": true, \"issues\": [], \"lessons\": [\"...\"]}\n\
+         Set `approve` to false and list concrete, actionable issues when the project does not satisfy its acceptance criteria or violates a constraint. Review the code, not the process.\n\
+         Add 3–5 `lessons` bullets for the next task: what went wrong, or what to keep doing. Each lesson must be concrete and short.\n",
     );
     Ok(prompt)
 }
@@ -323,12 +338,23 @@ fn run_review_gate(ctx: &ExecCtx) -> Result<Vec<Event>, String> {
     };
     let client = client_for(ctx, AgentRole::Reviewer)?;
     let response = client.complete(&request)?;
-    let result = match gate::evaluate_review(&response.text) {
-        Ok(result) => result,
-        Err(error) => GateResult::NeedsHuman {
-            question: format!("review agent returned an unusable verdict: {error}"),
+    let report = match gate::evaluate_review(&response.text) {
+        Ok(report) => report,
+        Err(error) => gate::ReviewReport {
+            result: GateResult::NeedsHuman {
+                question: format!("review agent returned an unusable verdict: {error}"),
+            },
+            lessons: Vec::new(),
         },
     };
+    if !report.lessons.is_empty() {
+        knowledge::write_lesson(
+            &ctx.lessons_dir,
+            &ctx.task_id,
+            &ctx.title,
+            &report.lessons,
+        )?;
+    }
     Ok(vec![
         Event::AgentInvoked {
             role: AgentRole::Reviewer,
@@ -341,7 +367,7 @@ fn run_review_gate(ctx: &ExecCtx) -> Result<Vec<Event>, String> {
         },
         Event::GateEvaluated {
             gate: GateId::ReviewAgent,
-            result,
+            result: report.result,
         },
     ])
 }
@@ -523,7 +549,7 @@ mod tests {
             open_questions: Vec::new(),
             feedback: Vec::new(),
         };
-        let prompt = build_prompt(&context, &template).unwrap();
+        let prompt = build_prompt(&context, &template, &[]).unwrap();
         assert!(prompt.contains("make a crate"));
         assert!(prompt.contains("- it compiles"));
         assert!(prompt.contains("- no crates"));
@@ -531,7 +557,7 @@ mod tests {
         assert!(prompt.contains("name = \"hello\""));
         assert!(prompt.contains("\"files\""));
         assert!(!prompt.contains("{{crate_name}}"));
-        assert_eq!(prompt, build_prompt(&context, &template).unwrap());
+        assert_eq!(prompt, build_prompt(&context, &template, &[]).unwrap());
 
         fs::remove_dir_all(&root).unwrap();
     }
@@ -552,11 +578,31 @@ mod tests {
             },
         );
         let context = Context::from_revision(&spec, &failures, Some("keep it small"));
-        let prompt = build_prompt(&context, Path::new("no-such-template-dir")).unwrap();
+        let prompt = build_prompt(&context, Path::new("no-such-template-dir"), &[]).unwrap();
         assert!(prompt.starts_with("Revise the existing project"));
         assert!(prompt.contains("## Revision feedback"));
         assert!(prompt.contains("- cargo check failed: boom"));
         assert!(prompt.contains("- human guidance: keep it small"));
+    }
+
+    #[test]
+    fn prompt_carries_previous_lessons() {
+        let spec = Spec {
+            title: "Hello".into(),
+            goal: "g".into(),
+            acceptance: vec!["a".into()],
+            ..Spec::default()
+        };
+        let context = Context::from_spec(&spec);
+        let lessons = vec![Lesson {
+            name: "earlier".into(),
+            body: "# Lessons — Earlier\n\n- write tests first".into(),
+        }];
+        let prompt =
+            build_prompt(&context, Path::new("no-such-template-dir"), &lessons).unwrap();
+        assert!(prompt.contains("# Lessons from previous tasks"));
+        assert!(prompt.contains("--- earlier.md ---"));
+        assert!(prompt.contains("- write tests first"));
     }
 
     #[test]

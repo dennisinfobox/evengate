@@ -1,6 +1,8 @@
-# Evengate — Technical Specification v0.6
+# Evengate — Technical Specification v0.7
 
 > A deterministic, Rust-native software factory that builds and improves itself under human oversight, and later produces pet projects in a familiar way.
+
+**Changes from v0.6:** the review agent returns 3–5 lessons; the executor writes them to `lessons/<task-id>.md`, and the next executor prompt carries the five most recent lesson files (§7.5, §7.6, §7.8, ADR-0010).
 
 **Changes from v0.5:** gate-blocked tasks have a bounded revision path — `ev revise` re-invokes the executor with the failing gate verdicts and optional human guidance, and `ev abandon` ends a blocked task without opening a PR (§7.2, §7.3, §7.6, ADR-0008).
 
@@ -272,6 +274,14 @@ pub struct TemplateClient { /* offline: renders templates/ into a manifest */ }
 
 The executor validates every path (relative, `/` separators, no `.`/`..`, bounded count and size), replaces `project/` with the manifest, and only then runs the gates. Prompt assembly is deterministic: the full spec and the reference template are rendered in declaration/sorted order, so the recorded prompt hash is reproducible.
 
+**Review protocol.** The reviewer answers one JSON object with an approval, concrete issues, and 3–5 short lessons:
+
+```json
+{"approve": true, "issues": [], "lessons": ["write tests first", "keep the crate small"]}
+```
+
+The executor writes the lessons to `lessons/<task-id>.md`; the raw response remains the event-log record from which that file can be reconstructed.
+
 **LiveClient** speaks the OpenAI-compatible chat-completions wire format. URL, key, per-role model, timeout, and optional token cap come from the environment — `EVENGATE_LLM_URL`, `EVENGATE_LLM_API_KEY`, `EVENGATE_MODEL_PLANNER|EXECUTOR|REVIEWER` (fallback `EVENGATE_MODEL`), `EVENGATE_LLM_TIMEOUT_SECS`, `EVENGATE_LLM_MAX_TOKENS`. The wire format is fixed; the vendor is not.
 
 **Client selection.** `EVENGATE_LLM=template|live|recorded`. Unset means `live` when `EVENGATE_LLM_URL` is set, otherwise `template`. `TemplateClient` is the deterministic offline agent: it renders `templates/bin` the same way the seed kernel did, so the hello scenario stays reproducible without credentials.
@@ -307,7 +317,7 @@ pub trait Gate {
 
 **Rule:** the executing agent has no mechanism to mark a gate as passed. Gates own their verdicts.
 
-`Compiles`, `TestsPass`, `LintsClean`, and `ReviewAgent` are the mandatory v0 gates, in that order. The review agent runs on the artifact the deterministic gates accepted, records its request and raw response as `Reviewer` events, and maps a withheld approval to `Fail` with the issues as the reason. A rejection stops the run for a human immediately rather than re-asking the same tree; an unusable verdict becomes `NeedsHuman`. Review requires a model: with the offline `TemplateClient` the run stops at this gate with an actionable error and resumes once a model is configured. The executor cannot pass this gate on the reviewer's behalf. From a blocked state the human can `ev revise` (executor re-runs with the verdicts) or `ev abandon`; see §7.3.
+`Compiles`, `TestsPass`, `LintsClean`, and `ReviewAgent` are the mandatory v0 gates, in that order. The review agent runs on the artifact the deterministic gates accepted, records its request and raw response as `Reviewer` events, and maps a withheld approval to `Fail` with the issues as the reason. A rejection stops the run for a human immediately rather than re-asking the same tree; an unusable verdict becomes `NeedsHuman`. Review requires a model: with the offline `TemplateClient` the run stops at this gate with an actionable error and resumes once a model is configured. The executor cannot pass this gate on the reviewer's behalf. From a blocked state the human can `ev revise` (executor re-runs with the verdicts) or `ev abandon`; see §7.3. The verdict's `lessons` are written to `lessons/<task-id>.md` before the gate result is recorded; a revision overwrites the same file.
 
 ### 7.7 `sandbox.rs` — process isolation
 
@@ -330,17 +340,17 @@ Knowledge is **structured, versioned, and fed back into prompts**. Not a vector 
 | Type | Written by | Consumed by |
 |------|------------|-------------|
 | `adr/<n>-<slug>.md` | Human or ReviewAgent | All future tasks in the project |
-| `lessons/<task-id>.md` | ReviewAgent after each task | Prompt assembly for similar tasks |
+| `lessons/<task-id>.md` | ReviewAgent verdict, written by executor | Prompt assembly for similar tasks |
 | `rules/<project>.md` | Human, or promoted from lessons | Every task in the project |
 | `codebase-map.md` | Regenerated periodically | Planning agent |
 | `patterns/<name>.md` | Promoted from repeated successes | Template selection |
 
-**Feedback mechanism (v0):** after every task, the `ReviewAgent` appends a `lessons/<task-id>.md` with 3–5 bullet points ("what went wrong, what to do differently"). The next task's prompt includes:
+**Feedback mechanism (v0):** the review verdict carries 3–5 `lessons` bullets ("what went wrong, what to do differently"). The executor writes them to `lessons/<task-id>.md`, overwriting on a revision, under the lessons root: `lessons/` in the working directory, overridable with `EVENGATE_LESSONS_DIR`. The next executor prompt includes:
 
-- the current `spec.md`,
-- `rules/<project>.md`,
-- the 5 most recent `lessons/*.md` (by recency, not similarity — a similarity index comes later),
-- `codebase-map.md`.
+- the current `spec.md` (always),
+- the 5 most recent `lessons/*.md`, newest first by file modification time, ties broken by file name (recency, not similarity — a similarity index comes later).
+
+The prompt states that the current spec and constraints win over inherited lessons. The raw reviewer response recorded in `AgentResponded` is the event-log source for a lesson file, so `ev replay` remains a pure fold. `rules/<project>.md` and `codebase-map.md` join the prompt once a later slice produces them; the lessons path is the v0 feedback loop.
 
 **Promotion path:** if the same lesson appears ≥ 3 times across tasks, `machine.rs` emits a `Command::RequestHumanReview` proposing to promote it to `rules/`. Promotion is always a human decision.
 

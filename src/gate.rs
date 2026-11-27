@@ -70,28 +70,42 @@ pub fn evaluate(gate: GateId, output: &RunOutput) -> GateResult {
     GateResult::Fail { reason }
 }
 
-/// Structured verdict from the review model: approval plus concrete issues.
-/// A malformed verdict is an error, not an approval; the executor turns that
-/// into `NeedsHuman` so a bad answer can never pass the gate.
+/// Structured verdict from the review model: approval, concrete issues, and
+/// the lessons the next task should inherit. A malformed verdict is an error,
+/// not an approval; the executor turns that into `NeedsHuman`.
 #[derive(Deserialize)]
 struct ReviewVerdict {
     approve: bool,
     #[serde(default)]
     issues: Vec<String>,
+    #[serde(default)]
+    lessons: Vec<String>,
 }
 
-pub fn evaluate_review(text: &str) -> Result<GateResult, String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewReport {
+    pub result: GateResult,
+    pub lessons: Vec<String>,
+}
+
+pub fn evaluate_review(text: &str) -> Result<ReviewReport, String> {
     let verdict: ReviewVerdict = serde_json::from_str(crate::llm::strip_fence(text))
         .map_err(|e| format!("review verdict is not JSON: {e}"))?;
-    if verdict.approve {
-        return Ok(GateResult::Pass);
-    }
-    let reason = if verdict.issues.is_empty() {
-        "review agent withheld approval without listing an issue".to_string()
+    let result = if verdict.approve {
+        GateResult::Pass
+    } else if verdict.issues.is_empty() {
+        GateResult::Fail {
+            reason: "review agent withheld approval without listing an issue".to_string(),
+        }
     } else {
-        format!("review agent: {}", verdict.issues.join("; "))
+        GateResult::Fail {
+            reason: format!("review agent: {}", verdict.issues.join("; ")),
+        }
     };
-    Ok(GateResult::Fail { reason })
+    Ok(ReviewReport {
+        result,
+        lessons: verdict.lessons,
+    })
 }
 
 #[cfg(test)]
@@ -141,11 +155,15 @@ mod tests {
     #[test]
     fn review_approval_passes_even_when_fenced() {
         assert_eq!(
-            evaluate_review("```json\n{\"approve\": true, \"issues\": []}\n```").unwrap(),
+            evaluate_review("```json\n{\"approve\": true, \"issues\": []}\n```")
+                .unwrap()
+                .result,
             GateResult::Pass
         );
         assert_eq!(
-            evaluate_review("{\"approve\": true, \"issues\": [\"nit\"]}").unwrap(),
+            evaluate_review("{\"approve\": true, \"issues\": [\"nit\"]}")
+                .unwrap()
+                .result,
             GateResult::Pass
         );
     }
@@ -153,7 +171,9 @@ mod tests {
     #[test]
     fn review_rejection_carries_all_issues() {
         let GateResult::Fail { reason } =
-            evaluate_review(r#"{"approve": false, "issues": ["no tests", "unsafe"]}"#).unwrap()
+            evaluate_review(r#"{"approve": false, "issues": ["no tests", "unsafe"]}"#)
+                .unwrap()
+                .result
         else {
             panic!("expected fail");
         };
@@ -162,12 +182,27 @@ mod tests {
 
     #[test]
     fn review_without_issues_still_fails() {
-        let GateResult::Fail { reason } =
-            evaluate_review(r#"{"approve": false}"#).unwrap()
+        let GateResult::Fail { reason } = evaluate_review(r#"{"approve": false}"#)
+            .unwrap()
+            .result
         else {
             panic!("expected fail");
         };
         assert!(reason.contains("without listing an issue"), "{reason}");
+    }
+
+    #[test]
+    fn review_keeps_the_lessons_for_the_next_task() {
+        let report = evaluate_review(
+            r#"{"approve": true, "issues": [], "lessons": ["write tests first", "keep it small"]}"#,
+        )
+        .unwrap();
+        assert_eq!(report.result, GateResult::Pass);
+        assert_eq!(report.lessons, vec!["write tests first", "keep it small"]);
+        assert!(evaluate_review(r#"{"approve": true}"#)
+            .unwrap()
+            .lessons
+            .is_empty());
     }
 
     #[test]
