@@ -1,6 +1,8 @@
-# Evengate — Technical Specification v0.8
+# Evengate — Technical Specification v0.9
 
 > A deterministic, Rust-native software factory that builds and improves itself under human oversight, and later produces pet projects in a familiar way.
+
+**Changes from v0.8:** `ev materialize <task-id>` is execution replay: it rebuilds the gitignored `project/` tree and `lessons/<task-id>.md` from `AgentResponded` events in log order, without a model or network (§6.3, §7.4, §7.8, ADR-0011).
 
 **Changes from v0.7:** a revision prompt now carries the project tree the gates judged instead of the reference template, and a gate failure reports the first actionable diagnostic rather than cargo's `Compiling`/`Checking` status line (§7.3, §7.4).
 
@@ -151,6 +153,8 @@ tasks/<task-id>/
 
 **Replay guarantee:** `ev replay <task-id>` reads `events.jsonl`, folds through `reduce`, and produces a `State` identical to the live run. Live LLM responses are recorded as events, so replay never calls the network.
 
+**Execution replay:** `ev materialize <task-id>` reconstructs the gitignored `project/` tree and `lessons/<task-id>.md` from `AgentResponded` events in log order. The last executor manifest wins; the last usable reviewer verdict supplies the lesson. It calls no model, spawns nothing, and leaves `state.json` untouched, so the pure-fold guarantee of `ev replay` is unchanged.
+
 **Formal contract:**
 
 ```rust
@@ -253,6 +257,8 @@ Thin. For each `Command`, the executor:
 
 The executor must never mutate `State` directly. It only returns events. A failing deterministic gate records one reason line: the first compiler error code, test panic, clippy warning, or generic error, in that order; cargo's progress lines are skipped because they are useless to a revision prompt.
 
+The same module owns `materialize`: it applies recorded executor manifests and reviewer lessons to disk in log order. It is the impure counterpart to `ev replay`, not part of the `Command` loop, and it never changes the log or the snapshot.
+
 ### 7.5 `llm/` — the model boundary
 
 ```rust
@@ -352,7 +358,7 @@ Knowledge is **structured, versioned, and fed back into prompts**. Not a vector 
 - the current `spec.md` (always),
 - the 5 most recent `lessons/*.md`, newest first by file modification time, ties broken by file name (recency, not similarity — a similarity index comes later).
 
-The prompt states that the current spec and constraints win over inherited lessons. The raw reviewer response recorded in `AgentResponded` is the event-log source for a lesson file, so `ev replay` remains a pure fold. `rules/<project>.md` and `codebase-map.md` join the prompt once a later slice produces them; the lessons path is the v0 feedback loop.
+The prompt states that the current spec and constraints win over inherited lessons. The raw reviewer response recorded in `AgentResponded` is the event-log source for a lesson file, so `ev replay` remains a pure fold and `ev materialize` can rebuild the file. `rules/<project>.md` and `codebase-map.md` join the prompt once a later slice produces them; the lessons path is the v0 feedback loop.
 
 **Promotion path:** if the same lesson appears ≥ 3 times across tasks, `machine.rs` emits a `Command::RequestHumanReview` proposing to promote it to `rules/`. Promotion is always a human decision.
 

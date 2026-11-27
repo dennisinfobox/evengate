@@ -18,6 +18,13 @@ const COMMIT_EMAIL: &str = "evengate@localhost";
 const REVIEW_FILE_CAP: usize = 256 * 1024;
 const REVIEW_SKIP_DIRS: [&str; 2] = [".git", "target"];
 
+/// Directory holding `lessons/<task-id>.md`.
+pub fn lessons_root() -> PathBuf {
+    env::var("EVENGATE_LESSONS_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("lessons"))
+}
+
 /// Everything the impure boundary needs. The executor never mutates `State`.
 pub struct ExecCtx {
     pub task_dir: PathBuf,
@@ -34,9 +41,7 @@ impl ExecCtx {
         let templates_dir = env::var("EVENGATE_TEMPLATES")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("templates/bin"));
-        let lessons_dir = env::var("EVENGATE_LESSONS_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("lessons"));
+        let lessons_dir = lessons_root();
         let task_id = task_dir
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
@@ -67,6 +72,75 @@ pub fn run(command: &Command, ctx: &ExecCtx) -> Result<Vec<Event>, String> {
         Command::Finalize { outcome } => finalize(*outcome, ctx),
         Command::AwaitHuman | Command::RequestHumanReview { .. } => Ok(Vec::new()),
     }
+}
+
+/// What `materialize` rebuilt from the log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaterializeReport {
+    pub responses: usize,
+    pub files: usize,
+    pub lesson: bool,
+}
+
+/// Rebuild the gitignored derivatives of a task from its event log: the
+/// last executor manifest becomes `project/`, and the last usable reviewer
+/// verdict becomes `lessons/<task-id>.md`. No model, network, or git.
+pub fn materialize(task_dir: &Path, lessons_dir: &Path) -> Result<MaterializeReport, String> {
+    let events = crate::log::read_events(task_dir)
+        .map_err(|e| format!("cannot read the event log: {e}"))?;
+    if events.is_empty() {
+        return Err(format!("no events to materialize in {}", task_dir.display()));
+    }
+    let state = events
+        .iter()
+        .fold(crate::state::initial(), crate::state::reduce);
+    if !state.task_created {
+        return Err("the event log has no TaskCreated event".into());
+    }
+    let ctx = ExecCtx::new(task_dir, &state.spec);
+
+    let mut report = MaterializeReport {
+        responses: 0,
+        files: 0,
+        lesson: false,
+    };
+    for event in &events {
+        if let Event::AgentResponded {
+            role: AgentRole::Executor,
+            response,
+            ..
+        } = event
+        {
+            let manifest = FileManifest::parse(response)?;
+            report.files += apply_manifest(&manifest, &ctx.project_dir())?;
+            report.responses += 1;
+        }
+    }
+    if report.responses == 0 {
+        return Err("the event log has no executor response to materialize".into());
+    }
+
+    for event in &events {
+        if let Event::AgentResponded {
+            role: AgentRole::Reviewer,
+            response,
+            ..
+        } = event
+        {
+            if let Ok(verdict) = gate::evaluate_review(response) {
+                if !verdict.lessons.is_empty() {
+                    knowledge::write_lesson(
+                        lessons_dir,
+                        &ctx.task_id,
+                        &ctx.title,
+                        &verdict.lessons,
+                    )?;
+                    report.lesson = true;
+                }
+            }
+        }
+    }
+    Ok(report)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -527,6 +601,7 @@ fn git_attempt(events: &mut Vec<Event>, dir: &Path, args: &[&str]) -> Result<Run
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::log;
     use std::collections::BTreeMap;
 
     #[test]
@@ -723,6 +798,135 @@ mod tests {
         assert!(prompt.contains("\"approve\""));
         assert_eq!(prompt, build_review_prompt(&context, &project).unwrap());
 
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    fn materialize_dir(tag: &str) -> PathBuf {
+        let root = env::temp_dir().join(format!(
+            "evengate-materialize-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        root
+    }
+
+    #[test]
+    fn materialize_rebuilds_the_project_and_the_lesson_file() {
+        let root = materialize_dir("rebuild");
+        let task = root.join("word-count");
+        let lessons = root.join("lessons");
+        log::append_event(
+            &task,
+            &Event::TaskCreated {
+                spec: Spec {
+                    title: "Word Count".into(),
+                    goal: "g".into(),
+                    ..Spec::default()
+                },
+            },
+        )
+        .unwrap();
+        log::append_event(
+            &task,
+            &Event::AgentResponded {
+                role: AgentRole::Executor,
+                response: r#"{"files":{"src/main.rs":"fn main() {}\n","Cargo.toml":"[package]\nname = \"word-count\"\n"}}"#.into(),
+                tokens: Default::default(),
+            },
+        )
+        .unwrap();
+        log::append_event(
+            &task,
+            &Event::AgentResponded {
+                role: AgentRole::Reviewer,
+                response:
+                    r#"{"approve":true,"issues":[],"lessons":["import what the tests use"]}"#.into(),
+                tokens: Default::default(),
+            },
+        )
+        .unwrap();
+        fs::create_dir_all(task.join("project/old")).unwrap();
+        fs::write(task.join("project/old/stale.txt"), "stale").unwrap();
+
+        let report = materialize(&task, &lessons).unwrap();
+        assert_eq!(
+            report,
+            MaterializeReport {
+                responses: 1,
+                files: 2,
+                lesson: true
+            }
+        );
+        assert_eq!(
+            fs::read_to_string(task.join("project/src/main.rs")).unwrap(),
+            "fn main() {}\n"
+        );
+        assert!(!task.join("project/old").exists());
+        let lesson = fs::read_to_string(lessons.join("word-count.md")).unwrap();
+        assert!(lesson.contains("- import what the tests use"));
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn materialize_keeps_only_the_last_manifest() {
+        let root = materialize_dir("revision");
+        let task = root.join("hello");
+        let lessons = root.join("lessons");
+        log::append_event(
+            &task,
+            &Event::TaskCreated {
+                spec: Spec {
+                    title: "Hello".into(),
+                    goal: "g".into(),
+                    ..Spec::default()
+                },
+            },
+        )
+        .unwrap();
+        for response in [
+            r#"{"files":{"src/main.rs":"old\n","stale.txt":"stale\n"}}"#,
+            r#"{"files":{"src/main.rs":"new\n"}}"#,
+        ] {
+            log::append_event(
+                &task,
+                &Event::AgentResponded {
+                    role: AgentRole::Executor,
+                    response: response.into(),
+                    tokens: Default::default(),
+                },
+            )
+            .unwrap();
+        }
+
+        let report = materialize(&task, &lessons).unwrap();
+        assert_eq!(report.responses, 2);
+        assert_eq!(
+            fs::read_to_string(task.join("project/src/main.rs")).unwrap(),
+            "new\n"
+        );
+        assert!(!task.join("project/stale.txt").exists());
+        assert!(!report.lesson);
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn materialize_requires_an_executor_response() {
+        let root = materialize_dir("missing");
+        let task = root.join("hello");
+        log::append_event(
+            &task,
+            &Event::TaskCreated {
+                spec: Spec {
+                    title: "Hello".into(),
+                    goal: "g".into(),
+                    ..Spec::default()
+                },
+            },
+        )
+        .unwrap();
+        assert!(materialize(&task, &root.join("lessons")).is_err());
         fs::remove_dir_all(&root).unwrap();
     }
 }

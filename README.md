@@ -10,7 +10,7 @@ Status: seed kernel works for one scenario — generate a crate from `templates/
 
 | File | Purpose |
 |---|---|
-| [`docs/spec.md`](docs/spec.md) | Authoritative design, v0.7 |
+| [`docs/spec.md`](docs/spec.md) | Authoritative design, v0.9 |
 | [`docs/STATUS.md`](docs/STATUS.md) | Current phase, next step, blockers |
 | [`docs/DECISIONS.md`](docs/DECISIONS.md) | Decision log with rationale |
 | [`AGENTS.md`](AGENTS.md) | Rules for agents and contributors |
@@ -23,6 +23,7 @@ cargo build --locked
 
 cargo run --locked --bin ev -- run tasks/hello/spec.md
 cargo run --locked --bin ev -- replay tasks/hello
+cargo run --locked --bin ev -- materialize tasks/hello   # rebuild project/ from the log
 
 # after reviewing the branch:
 cargo run --locked --bin ev -- approve tasks/hello --reviewer <your-name>
@@ -44,6 +45,8 @@ The `ReviewAgent` gate is mandatory and needs a model. With no endpoint configur
 When a gate blocks a task, `ev revise` re-runs the executor with the failing verdicts, any human guidance, and the current project tree, then reruns every gate (at most two revisions). `ev abandon` ends a blocked task without a PR.
 
 The review agent also returns 3–5 lessons. The executor writes them to `lessons/<task-id>.md`, and the next executor prompt includes the five most recent lesson files; the current spec always wins over inherited advice.
+
+`project/` and `lessons/` are derived state. `ev materialize <task-dir>` rebuilds both from `events.jsonl` without a model or network: the last executor manifest becomes `project/`, and the last usable reviewer verdict becomes the lesson file. `state.json` is untouched.
 
 ## Working on it
 

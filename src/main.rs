@@ -24,6 +24,7 @@ ev — Evengate control plane
 Usage:
   ev run <spec.md>                          start or resume a task
   ev replay <task-dir>                      rebuild state.json from events.jsonl
+  ev materialize <task-dir>                 rebuild project/ and lessons from events.jsonl
   ev approve <task-dir> --reviewer <name>   record human approval, then finalize
   ev reject <task-dir> --reviewer <name> --reason <text>
   ev revise <task-dir> --reviewer <name> [--reason <text>]
@@ -44,6 +45,7 @@ fn dispatch(args: &[String]) -> Result<(), String> {
     match args.first().map(String::as_str) {
         Some("run") => run_task(args),
         Some("replay") => replay(args),
+        Some("materialize") => materialize(args),
         Some("approve") => decide(args, true),
         Some("reject") => decide(args, false),
         Some("revise") => revise(args),
@@ -139,6 +141,22 @@ fn replay(args: &[String]) -> Result<(), String> {
         }
         None => println!("ev: replay created state.json (no previous snapshot)"),
     }
+    Ok(())
+}
+
+fn materialize(args: &[String]) -> Result<(), String> {
+    let task_dir = PathBuf::from(args.get(1).ok_or("usage: ev materialize <task-dir>")?);
+    let report = executor::materialize(&task_dir, &executor::lessons_root())?;
+    println!(
+        "ev: materialized {} executor response(s) into {} file(s){}",
+        report.responses,
+        report.files,
+        if report.lesson {
+            "; rebuilt the lesson file"
+        } else {
+            ""
+        }
+    );
     Ok(())
 }
 
