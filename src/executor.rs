@@ -119,7 +119,12 @@ fn invoke_agent(
     ctx: &ExecCtx,
 ) -> Result<Vec<Event>, String> {
     let lessons = knowledge::recent_lessons(&ctx.lessons_dir, knowledge::RECENT_LESSONS)?;
-    let prompt = build_prompt(context, &ctx.templates_dir, &lessons)?;
+    let current = if context.feedback.is_empty() {
+        None
+    } else {
+        Some(read_project_files(&ctx.project_dir())?)
+    };
+    let prompt = build_prompt(context, &ctx.templates_dir, &lessons, current.as_ref())?;
     let request = LlmRequest { role, prompt };
     let client = client_for(ctx, role)?;
     let response = client.complete(&request)?;
@@ -138,9 +143,14 @@ fn invoke_agent(
     ])
 }
 
-/// Deterministic prompt assembly. The template is included so a live agent
-/// has the same source material the offline template client renders.
-fn build_prompt(context: &Context, templates: &Path, lessons: &[Lesson]) -> Result<String, String> {
+/// Deterministic prompt assembly. A first build sees the template; a revision
+/// sees the tree the gates judged instead.
+fn build_prompt(
+    context: &Context,
+    templates: &Path,
+    lessons: &[Lesson],
+    current: Option<&BTreeMap<String, String>>,
+) -> Result<String, String> {
     let mut prompt = String::new();
     if context.feedback.is_empty() {
         prompt.push_str("Build the complete project described below.\n");
@@ -153,7 +163,14 @@ fn build_prompt(context: &Context, templates: &Path, lessons: &[Lesson]) -> Resu
     push_list(&mut prompt, "Revision feedback", &context.feedback);
     prompt.push_str(&knowledge::prompt_section(lessons));
 
-    if templates.is_dir() {
+    if let Some(files) = current {
+        prompt.push_str(
+            "\n# Current project\nThese are the files the gates judged. Edit them into the answer instead of starting over.\n",
+        );
+        for (path, content) in files {
+            let _ = writeln!(prompt, "\n--- {path} ---\n{content}");
+        }
+    } else if templates.is_dir() {
         let files = llm::read_template_files(templates, &context.project)?;
         if !files.is_empty() {
             prompt.push_str(
@@ -549,7 +566,7 @@ mod tests {
             open_questions: Vec::new(),
             feedback: Vec::new(),
         };
-        let prompt = build_prompt(&context, &template, &[]).unwrap();
+        let prompt = build_prompt(&context, &template, &[], None).unwrap();
         assert!(prompt.contains("make a crate"));
         assert!(prompt.contains("- it compiles"));
         assert!(prompt.contains("- no crates"));
@@ -557,7 +574,7 @@ mod tests {
         assert!(prompt.contains("name = \"hello\""));
         assert!(prompt.contains("\"files\""));
         assert!(!prompt.contains("{{crate_name}}"));
-        assert_eq!(prompt, build_prompt(&context, &template, &[]).unwrap());
+        assert_eq!(prompt, build_prompt(&context, &template, &[], None).unwrap());
 
         fs::remove_dir_all(&root).unwrap();
     }
@@ -578,7 +595,7 @@ mod tests {
             },
         );
         let context = Context::from_revision(&spec, &failures, Some("keep it small"));
-        let prompt = build_prompt(&context, Path::new("no-such-template-dir"), &[]).unwrap();
+        let prompt = build_prompt(&context, Path::new("no-such-template-dir"), &[], None).unwrap();
         assert!(prompt.starts_with("Revise the existing project"));
         assert!(prompt.contains("## Revision feedback"));
         assert!(prompt.contains("- cargo check failed: boom"));
@@ -599,10 +616,39 @@ mod tests {
             body: "# Lessons — Earlier\n\n- write tests first".into(),
         }];
         let prompt =
-            build_prompt(&context, Path::new("no-such-template-dir"), &lessons).unwrap();
+            build_prompt(&context, Path::new("no-such-template-dir"), &lessons, None).unwrap();
         assert!(prompt.contains("# Lessons from previous tasks"));
         assert!(prompt.contains("--- earlier.md ---"));
         assert!(prompt.contains("- write tests first"));
+    }
+
+    #[test]
+    fn revision_prompt_shows_the_current_project_instead_of_the_template() {
+        let spec = Spec {
+            title: "Hello".into(),
+            goal: "g".into(),
+            acceptance: vec!["a".into()],
+            ..Spec::default()
+        };
+        let mut failures = BTreeMap::new();
+        failures.insert(
+            GateId::Compiles,
+            GateResult::Fail {
+                reason: "boom".into(),
+            },
+        );
+        let context = Context::from_revision(&spec, &failures, None);
+        let mut current = BTreeMap::new();
+        current.insert(
+            "src/main.rs".to_string(),
+            "fn main() { let broken: i32 = \"x\"; }\n".to_string(),
+        );
+        let prompt =
+            build_prompt(&context, Path::new("no-such-template-dir"), &[], Some(&current)).unwrap();
+        assert!(prompt.contains("# Current project"));
+        assert!(prompt.contains("--- src/main.rs ---"));
+        assert!(prompt.contains("let broken"));
+        assert!(!prompt.contains("# Reference template"));
     }
 
     #[test]

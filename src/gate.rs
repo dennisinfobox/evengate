@@ -56,18 +56,35 @@ pub fn evaluate(gate: GateId, output: &RunOutput) -> GateResult {
     if output.exit_code == 0 {
         return GateResult::Pass;
     }
-    let detail = output
-        .stderr
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .unwrap_or("");
+    let detail = failure_detail(output);
     let reason = if detail.is_empty() {
         format!("{}: exit code {}", label(gate), output.exit_code)
     } else {
         format!("{}: {detail}", label(gate))
     };
     GateResult::Fail { reason }
+}
+
+/// Pick the most actionable line: compiler error code, test panic, clippy
+/// warning, then any generic error. Cargo's `Compiling`/`Checking` lines are
+/// useless as a revision prompt.
+fn failure_detail(output: &RunOutput) -> String {
+    let lines = || {
+        output
+            .stderr
+            .lines()
+            .chain(output.stdout.lines())
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+    };
+    let find = |predicate: fn(&str) -> bool| lines().find(|line| predicate(line));
+    find(|line| line.starts_with("error["))
+        .or_else(|| find(|line| line.contains("panicked at")))
+        .or_else(|| find(|line| line.starts_with("warning:")))
+        .or_else(|| find(|line| line.starts_with("error:")))
+        .or_else(|| lines().next())
+        .unwrap_or("")
+        .to_string()
 }
 
 /// Structured verdict from the review model: approval, concrete issues, and
@@ -137,6 +154,47 @@ mod tests {
             panic!("expected fail");
         };
         assert_eq!(reason, "cargo test: thread 'x' panicked");
+    }
+
+    #[test]
+    fn failure_detail_prefers_the_actual_diagnostic() {
+        let out = output(
+            101,
+            "   Compiling word-count-cli v0.1.0 (/work)\nerror[E0433]: cannot find module `tempfile`\n",
+        );
+        let GateResult::Fail { reason } = evaluate(GateId::TestsPass, &out) else {
+            panic!("expected fail");
+        };
+        assert_eq!(
+            reason,
+            "cargo test: error[E0433]: cannot find module `tempfile`"
+        );
+    }
+
+    #[test]
+    fn failure_detail_prefers_a_test_panic_over_cargos_error_line() {
+        let mut out = output(101, "error: test failed, to rerun pass `--bin x`");
+        out.stdout =
+            "running 1 test\nfailures:\nthread 'x' panicked at src/main.rs:4:5".to_string();
+        let GateResult::Fail { reason } = evaluate(GateId::TestsPass, &out) else {
+            panic!("expected fail");
+        };
+        assert_eq!(
+            reason,
+            "cargo test: thread 'x' panicked at src/main.rs:4:5"
+        );
+    }
+
+    #[test]
+    fn failure_detail_uses_a_clippy_warning_when_there_is_no_error() {
+        let out = output(
+            101,
+            "    Checking x v0.1.0 (/work)\nwarning: unused variable: `n`\n",
+        );
+        let GateResult::Fail { reason } = evaluate(GateId::LintsClean, &out) else {
+            panic!("expected fail");
+        };
+        assert_eq!(reason, "cargo clippy: warning: unused variable: `n`");
     }
 
     #[test]

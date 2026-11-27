@@ -41,7 +41,7 @@ The executing agent defaults to the offline `TemplateClient`. Set `EVENGATE_LLM_
 
 The `ReviewAgent` gate is mandatory and needs a model. With no endpoint configured, `ev run` executes the template agent and the three deterministic gates, then stops at the review gate with an actionable error; re-run with `EVENGATE_LLM_URL` set to finish the review and open the PR. `ev replay` is always offline.
 
-When a gate blocks a task, `ev revise` re-runs the executor with the failing verdicts and any human guidance, then reruns every gate on the new tree (at most two revisions). `ev abandon` ends a blocked task without a PR.
+When a gate blocks a task, `ev revise` re-runs the executor with the failing verdicts, any human guidance, and the current project tree, then reruns every gate (at most two revisions). `ev abandon` ends a blocked task without a PR.
 
 The review agent also returns 3–5 lessons. The executor writes them to `lessons/<task-id>.md`, and the next executor prompt includes the five most recent lesson files; the current spec always wins over inherited advice.
 

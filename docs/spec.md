@@ -1,6 +1,8 @@
-# Evengate — Technical Specification v0.7
+# Evengate — Technical Specification v0.8
 
 > A deterministic, Rust-native software factory that builds and improves itself under human oversight, and later produces pet projects in a familiar way.
+
+**Changes from v0.7:** a revision prompt now carries the project tree the gates judged instead of the reference template, and a gate failure reports the first actionable diagnostic rather than cargo's `Compiling`/`Checking` status line (§7.3, §7.4).
 
 **Changes from v0.6:** the review agent returns 3–5 lessons; the executor writes them to `lessons/<task-id>.md`, and the next executor prompt carries the five most recent lesson files (§7.5, §7.6, §7.8, ADR-0010).
 
@@ -239,7 +241,7 @@ pub enum Command {
 - `Finalize { Merged }` is unreachable unless every mandatory gate passed **and** a `HumanApproved` event exists.
 - No command is issued twice in a row with identical parameters (loop protection).
 
-**Revision path.** A gate that still fails after `MAX_GATE_ATTEMPTS`, or a review rejection, leaves the task in `Verifying` with `RequestHumanReview`. The human may then issue `RevisionRequested`, which is accepted only in `Verifying` with at least one non-passing verdict. The reducer snapshots those verdicts and the optional guidance into `State`, increments the revision counter, clears every gate verdict and attempt counter, and enters `Revising`. `next_command` then issues one `InvokeAgent` whose `Context` carries the failures; the response moves the task to `Generating` and back to `Verifying`, so every gate runs again on the new tree. Revisions are capped at `MAX_REVISIONS` (2); at the cap the machine requests a human again. `HumanAbandoned` ends the task from any non-terminal phase, while `TaskAbandoned` remains the consequence of rejecting a PR.
+**Revision path.** A gate that still fails after `MAX_GATE_ATTEMPTS`, or a review rejection, leaves the task in `Verifying` with `RequestHumanReview`. The human may then issue `RevisionRequested`, which is accepted only in `Verifying` with at least one non-passing verdict. The reducer snapshots those verdicts and the optional guidance into `State`, increments the revision counter, clears every gate verdict and attempt counter, and enters `Revising`. `next_command` then issues one `InvokeAgent` whose `Context` carries the failures and whose prompt includes the current project tree; the response moves the task to `Generating` and back to `Verifying`, so every gate runs again on the new tree. Revisions are capped at `MAX_REVISIONS` (2); at the cap the machine requests a human again. `HumanAbandoned` ends the task from any non-terminal phase, while `TaskAbandoned` remains the consequence of rejecting a PR.
 
 ### 7.4 `executor.rs` — the impure boundary
 
@@ -249,7 +251,7 @@ Thin. For each `Command`, the executor:
 2. Emits one or more `Event`s.
 3. Returns them for the outer loop to log and reduce.
 
-The executor must never mutate `State` directly. It only returns events.
+The executor must never mutate `State` directly. It only returns events. A failing deterministic gate records one reason line: the first compiler error code, test panic, clippy warning, or generic error, in that order; cargo's progress lines are skipped because they are useless to a revision prompt.
 
 ### 7.5 `llm/` — the model boundary
 
