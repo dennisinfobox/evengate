@@ -77,6 +77,34 @@ pub fn recent_lessons(dir: &Path, limit: usize) -> Result<Vec<Lesson>, String> {
         .collect()
 }
 
+/// Read `rules/<project>.md`. A missing or blank file means the project has
+/// no extra rules; an unreadable file is an error, never silently ignored.
+pub fn read_rules(dir: &Path, project: &str) -> Result<Option<String>, String> {
+    let path = dir.join(format!("{}.md", file_stem(project)));
+    match fs::read_to_string(&path) {
+        Ok(body) => {
+            let body = body.trim();
+            Ok(if body.is_empty() {
+                None
+            } else {
+                Some(body.to_string())
+            })
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("cannot read {}: {error}", path.display())),
+    }
+}
+
+/// Prompt section for project-wide rules. Empty when there are none.
+pub fn rules_section(rules: Option<&str>) -> String {
+    match rules {
+        None => String::new(),
+        Some(rules) => format!(
+            "\n# Project rules\nThese rules apply to every task in this project. Follow them together with the task spec; the more specific instruction wins.\n\n{rules}\n"
+        ),
+    }
+}
+
 /// Prompt section for the executor. Empty when there is no knowledge yet.
 pub fn prompt_section(lessons: &[Lesson]) -> String {
     if lessons.is_empty() {
@@ -187,6 +215,27 @@ mod tests {
         assert_eq!(lessons[0].name, "third");
         assert_eq!(lessons[1].name, "second");
         assert!(lessons[0].body.contains("- three"));
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn rules_are_optional_but_not_silently_broken() {
+        let dir = temp_dir("rules");
+        assert_eq!(read_rules(&dir, "hello").unwrap(), None);
+
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("hello.md"), "  \n").unwrap();
+        assert_eq!(read_rules(&dir, "hello").unwrap(), None);
+
+        fs::write(dir.join("hello.md"), "\n No unsafe code. \n").unwrap();
+        assert_eq!(
+            read_rules(&dir, "hello").unwrap().as_deref(),
+            Some("No unsafe code.")
+        );
+
+        fs::write(dir.join("hello.md"), [0xff, 0xfe]).unwrap();
+        assert!(read_rules(&dir, "hello").is_err());
 
         fs::remove_dir_all(&dir).unwrap();
     }

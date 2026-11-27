@@ -1,6 +1,8 @@
-# Evengate — Technical Specification v0.10
+# Evengate — Technical Specification v0.11
 
 > A deterministic, Rust-native software factory that builds and improves itself under human oversight, and later produces pet projects in a familiar way.
+
+**Changes from v0.10:** project-wide `rules/<project>.md` now joins every executor and reviewer prompt, read from the rules root (`rules/` by default, `EVENGATE_RULES_DIR` overrides) at prompt-assembly time (§7.8, ADR-0013).
 
 **Changes from v0.9:** gate containers gain read-only filesystems, read-only project mounts, a bounded writable `/tmp`, and memory, swap, PID, and CPU caps; capabilities are dropped and privileges cannot escalate (§7.7, ADR-0012).
 
@@ -362,9 +364,10 @@ Knowledge is **structured, versioned, and fed back into prompts**. Not a vector 
 **Feedback mechanism (v0):** the review verdict carries 3–5 `lessons` bullets ("what went wrong, what to do differently"). The executor writes them to `lessons/<task-id>.md`, overwriting on a revision, under the lessons root: `lessons/` in the working directory, overridable with `EVENGATE_LESSONS_DIR`. The next executor prompt includes:
 
 - the current `spec.md` (always),
+- `rules/<project>.md`, when present, under the rules root (`rules/` by default, `EVENGATE_RULES_DIR` overrides),
 - the 5 most recent `lessons/*.md`, newest first by file modification time, ties broken by file name (recency, not similarity — a similarity index comes later).
 
-The prompt states that the current spec and constraints win over inherited lessons. The raw reviewer response recorded in `AgentResponded` is the event-log source for a lesson file, so `ev replay` remains a pure fold and `ev materialize` can rebuild the file. `rules/<project>.md` and `codebase-map.md` join the prompt once a later slice produces them; the lessons path is the v0 feedback loop.
+The prompt states that the current spec and constraints win over inherited lessons. Rules and lessons are read during prompt assembly, never cached in `State`, so a human edit applies to the next invocation. The same `# Project rules` section is given to the review agent, so a project rule is checked as well as prompted. The raw reviewer response recorded in `AgentResponded` is the event-log source for a lesson file, so `ev replay` remains a pure fold and `ev materialize` can rebuild the file. `codebase-map.md` joins the prompt once a planner consumes it; the lessons path is the v0 feedback loop.
 
 **Promotion path:** if the same lesson appears ≥ 3 times across tasks, `machine.rs` emits a `Command::RequestHumanReview` proposing to promote it to `rules/`. Promotion is always a human decision.
 

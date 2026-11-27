@@ -25,6 +25,13 @@ pub fn lessons_root() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("lessons"))
 }
 
+/// Directory holding project-wide `rules/<project>.md`.
+pub fn rules_root() -> PathBuf {
+    env::var("EVENGATE_RULES_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("rules"))
+}
+
 /// Everything the impure boundary needs. The executor never mutates `State`.
 pub struct ExecCtx {
     pub task_dir: PathBuf,
@@ -32,6 +39,7 @@ pub struct ExecCtx {
     pub title: String,
     pub templates_dir: PathBuf,
     pub lessons_dir: PathBuf,
+    pub rules_dir: PathBuf,
     task_id: String,
     context: Context,
 }
@@ -42,6 +50,7 @@ impl ExecCtx {
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("templates/bin"));
         let lessons_dir = lessons_root();
+        let rules_dir = rules_root();
         let task_id = task_dir
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
@@ -52,6 +61,7 @@ impl ExecCtx {
             title: spec.title.clone(),
             templates_dir,
             lessons_dir,
+            rules_dir,
             task_id,
             context: Context::from_spec(spec),
         }
@@ -193,12 +203,19 @@ fn invoke_agent(
     ctx: &ExecCtx,
 ) -> Result<Vec<Event>, String> {
     let lessons = knowledge::recent_lessons(&ctx.lessons_dir, knowledge::RECENT_LESSONS)?;
+    let rules = knowledge::read_rules(&ctx.rules_dir, &ctx.project_name)?;
     let current = if context.feedback.is_empty() {
         None
     } else {
         Some(read_project_files(&ctx.project_dir())?)
     };
-    let prompt = build_prompt(context, &ctx.templates_dir, &lessons, current.as_ref())?;
+    let prompt = build_prompt(
+        context,
+        &ctx.templates_dir,
+        &lessons,
+        rules.as_deref(),
+        current.as_ref(),
+    )?;
     let request = LlmRequest { role, prompt };
     let client = client_for(ctx, role)?;
     let response = client.complete(&request)?;
@@ -223,6 +240,7 @@ fn build_prompt(
     context: &Context,
     templates: &Path,
     lessons: &[Lesson],
+    rules: Option<&str>,
     current: Option<&BTreeMap<String, String>>,
 ) -> Result<String, String> {
     let mut prompt = String::new();
@@ -234,6 +252,7 @@ fn build_prompt(
         );
     }
     push_task_spec(&mut prompt, context);
+    prompt.push_str(&knowledge::rules_section(rules));
     push_list(&mut prompt, "Revision feedback", &context.feedback);
     prompt.push_str(&knowledge::prompt_section(lessons));
 
@@ -266,10 +285,15 @@ fn build_prompt(
 
 /// The reviewer sees the real artifact the deterministic gates approved, not
 /// the executing agent's summary of it.
-fn build_review_prompt(context: &Context, project: &Path) -> Result<String, String> {
+fn build_review_prompt(
+    context: &Context,
+    project: &Path,
+    rules: Option<&str>,
+) -> Result<String, String> {
     let mut prompt =
         String::from("Review the complete project below before it is offered to the human owner.\n");
     push_task_spec(&mut prompt, context);
+    prompt.push_str(&knowledge::rules_section(rules));
     let files = read_project_files(project)?;
     prompt.push_str("\n# Project files\n");
     for (path, content) in files {
@@ -422,7 +446,8 @@ fn run_gate(gate_id: GateId, ctx: &ExecCtx) -> Result<Vec<Event>, String> {
 /// LLM-backed gate. The model's raw verdict is recorded as a `Reviewer`
 /// response; an unusable answer becomes `NeedsHuman`, never a pass.
 fn run_review_gate(ctx: &ExecCtx) -> Result<Vec<Event>, String> {
-    let prompt = build_review_prompt(&ctx.context, &ctx.project_dir())?;
+    let rules = knowledge::read_rules(&ctx.rules_dir, &ctx.project_name)?;
+    let prompt = build_review_prompt(&ctx.context, &ctx.project_dir(), rules.as_deref())?;
     let request = LlmRequest {
         role: AgentRole::Reviewer,
         prompt,
@@ -641,7 +666,7 @@ mod tests {
             open_questions: Vec::new(),
             feedback: Vec::new(),
         };
-        let prompt = build_prompt(&context, &template, &[], None).unwrap();
+        let prompt = build_prompt(&context, &template, &[], None, None).unwrap();
         assert!(prompt.contains("make a crate"));
         assert!(prompt.contains("- it compiles"));
         assert!(prompt.contains("- no crates"));
@@ -649,7 +674,7 @@ mod tests {
         assert!(prompt.contains("name = \"hello\""));
         assert!(prompt.contains("\"files\""));
         assert!(!prompt.contains("{{crate_name}}"));
-        assert_eq!(prompt, build_prompt(&context, &template, &[], None).unwrap());
+        assert_eq!(prompt, build_prompt(&context, &template, &[], None, None).unwrap());
 
         fs::remove_dir_all(&root).unwrap();
     }
@@ -670,7 +695,8 @@ mod tests {
             },
         );
         let context = Context::from_revision(&spec, &failures, Some("keep it small"));
-        let prompt = build_prompt(&context, Path::new("no-such-template-dir"), &[], None).unwrap();
+        let prompt =
+            build_prompt(&context, Path::new("no-such-template-dir"), &[], None, None).unwrap();
         assert!(prompt.starts_with("Revise the existing project"));
         assert!(prompt.contains("## Revision feedback"));
         assert!(prompt.contains("- cargo check failed: boom"));
@@ -691,10 +717,49 @@ mod tests {
             body: "# Lessons — Earlier\n\n- write tests first".into(),
         }];
         let prompt =
-            build_prompt(&context, Path::new("no-such-template-dir"), &lessons, None).unwrap();
+            build_prompt(&context, Path::new("no-such-template-dir"), &lessons, None, None).unwrap();
         assert!(prompt.contains("# Lessons from previous tasks"));
         assert!(prompt.contains("--- earlier.md ---"));
         assert!(prompt.contains("- write tests first"));
+    }
+
+    #[test]
+    fn prompt_carries_project_rules_before_lessons() {
+        let spec = Spec {
+            title: "Hello".into(),
+            goal: "g".into(),
+            acceptance: vec!["a".into()],
+            ..Spec::default()
+        };
+        let context = Context::from_spec(&spec);
+        let lessons = vec![Lesson {
+            name: "earlier".into(),
+            body: "- be small".into(),
+        }];
+        let prompt = build_prompt(
+            &context,
+            Path::new("no-such-template-dir"),
+            &lessons,
+            Some("No unsafe code.\nNo network."),
+            None,
+        )
+        .unwrap();
+        assert!(prompt.contains("# Project rules\n"));
+        assert!(prompt.contains("No unsafe code."));
+        let rules_at = prompt.find("# Project rules").unwrap();
+        let lessons_at = prompt.find("# Lessons from previous tasks").unwrap();
+        assert!(rules_at < lessons_at);
+        assert_eq!(
+            prompt,
+            build_prompt(
+                &context,
+                Path::new("no-such-template-dir"),
+                &lessons,
+                Some("No unsafe code.\nNo network."),
+                None,
+            )
+            .unwrap()
+        );
     }
 
     #[test]
@@ -718,8 +783,14 @@ mod tests {
             "src/main.rs".to_string(),
             "fn main() { let broken: i32 = \"x\"; }\n".to_string(),
         );
-        let prompt =
-            build_prompt(&context, Path::new("no-such-template-dir"), &[], Some(&current)).unwrap();
+        let prompt = build_prompt(
+            &context,
+            Path::new("no-such-template-dir"),
+            &[],
+            None,
+            Some(&current),
+        )
+        .unwrap();
         assert!(prompt.contains("# Current project"));
         assert!(prompt.contains("--- src/main.rs ---"));
         assert!(prompt.contains("let broken"));
@@ -790,13 +861,17 @@ mod tests {
             open_questions: Vec::new(),
             feedback: Vec::new(),
         };
-        let prompt = build_review_prompt(&context, &project).unwrap();
+        let rules = Some("No unsafe code.");
+        let prompt = build_review_prompt(&context, &project, rules).unwrap();
         assert!(prompt.contains("--- src/main.rs ---\nfn main() {}"));
         assert!(prompt.contains("--- Cargo.toml ---"));
         assert!(!prompt.contains(".git/HEAD"));
         assert!(!prompt.contains("target/debug/junk"));
+        assert!(prompt.contains("# Project rules\n"));
+        assert!(prompt.contains("No unsafe code."));
+        assert!(prompt.find("# Project rules").unwrap() < prompt.find("# Project files").unwrap());
         assert!(prompt.contains("\"approve\""));
-        assert_eq!(prompt, build_review_prompt(&context, &project).unwrap());
+        assert_eq!(prompt, build_review_prompt(&context, &project, rules).unwrap());
 
         fs::remove_dir_all(&root).unwrap();
     }
