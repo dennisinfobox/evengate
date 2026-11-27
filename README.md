@@ -33,6 +33,8 @@ Binaries: `ev` (daily use) and `evengate` (scripts, CI), both built from `src/ma
 
 Environment: `EVENGATE_SANDBOX_IMAGE`, `EVENGATE_SANDBOX_TIMEOUT_SECS`, `EVENGATE_TEMPLATES`.
 
+The executing agent defaults to the offline `TemplateClient`. Set `EVENGATE_LLM_URL` (an OpenAI-compatible chat-completions endpoint) to switch to `LiveClient`; `EVENGATE_LLM=template|live|recorded` overrides the choice. Live mode reads `EVENGATE_LLM_API_KEY`, `EVENGATE_MODEL_EXECUTOR`/`_PLANNER`/`_REVIEWER` (fallback `EVENGATE_MODEL`), `EVENGATE_LLM_TIMEOUT_SECS`, and `EVENGATE_LLM_MAX_TOKENS`. With no endpoint configured, `ev run` and `ev replay` stay fully offline.
+
 ## Working on it
 
 Read `AGENTS.md`, then `docs/STATUS.md`. All repository documentation is written in English.

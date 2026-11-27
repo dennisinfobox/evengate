@@ -1,6 +1,7 @@
 mod event;
 mod executor;
 mod gate;
+mod llm;
 mod log;
 mod machine;
 mod sandbox;

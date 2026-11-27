@@ -1,10 +1,12 @@
 use std::env;
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command as Process;
 
-use crate::event::{AgentRole, Event, GateId, TokenUsage};
+use crate::event::{AgentRole, Event, GateId};
 use crate::gate;
+use crate::llm::{self, FileManifest, LiveClient, LlmClient, LlmRequest, RecordedClient, TemplateClient};
 use crate::machine::{Command, Context, Outcome};
 use crate::sandbox::{self, RunOutput, Sandbox};
 use crate::spec::{self, Spec};
@@ -50,71 +52,132 @@ pub fn run(command: &Command, ctx: &ExecCtx) -> Result<Vec<Event>, String> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClientMode {
+    Template,
+    Live,
+    Recorded,
+}
+
+fn client_mode() -> Result<ClientMode, String> {
+    match env::var("EVENGATE_LLM") {
+        Ok(value) => match value.trim() {
+            "template" => Ok(ClientMode::Template),
+            "live" => Ok(ClientMode::Live),
+            "recorded" => Ok(ClientMode::Recorded),
+            other => Err(format!(
+                "EVENGATE_LLM must be template, live, or recorded; got `{other}`"
+            )),
+        },
+        Err(_) => Ok(if env::var_os("EVENGATE_LLM_URL").is_some() {
+            ClientMode::Live
+        } else {
+            ClientMode::Template
+        }),
+    }
+}
+
+fn client_for(ctx: &ExecCtx) -> Result<Box<dyn LlmClient>, String> {
+    match client_mode()? {
+        ClientMode::Template => Ok(Box::new(TemplateClient::new(
+            ctx.templates_dir.clone(),
+            ctx.project_name.clone(),
+        ))),
+        ClientMode::Live => Ok(Box::new(LiveClient::from_env()?)),
+        ClientMode::Recorded => {
+            let events = crate::log::read_events(&ctx.task_dir)
+                .map_err(|e| format!("cannot read the event log: {e}"))?;
+            Ok(Box::new(RecordedClient::from_events(&events)))
+        }
+    }
+}
+
 fn invoke_agent(
     role: AgentRole,
     context: &Context,
     ctx: &ExecCtx,
 ) -> Result<Vec<Event>, String> {
-    let project = ctx.project_dir();
-    let files = materialize(&ctx.templates_dir, &project, &ctx.project_name)?;
-    let prompt = serde_json::to_string(context).map_err(|e| format!("prompt encode: {e}"))?;
-    let hash = fnv1a64(prompt.as_bytes());
+    let prompt = build_prompt(context, &ctx.templates_dir)?;
+    let request = LlmRequest { role, prompt };
+    let client = client_for(ctx)?;
+    let response = client.complete(&request)?;
+    let manifest = FileManifest::parse(&response.text)?;
+    apply_manifest(&manifest, &ctx.project_dir())?;
     Ok(vec![
         Event::AgentInvoked {
             role,
-            prompt_hash: format!("{hash:016x}"),
+            prompt_hash: request.prompt_hash(),
         },
         Event::AgentResponded {
             role,
-            response: format!("stub agent copied {files} template file(s) into project/"),
-            tokens: TokenUsage::default(),
+            response: response.text,
+            tokens: response.tokens,
         },
     ])
 }
 
-fn materialize(template: &Path, dst: &Path, crate_name: &str) -> Result<usize, String> {
-    if !template.is_dir() {
-        return Err(format!(
-            "template directory not found: {} (set EVENGATE_TEMPLATES)",
-            template.display()
-        ));
-    }
-    if dst.exists() {
-        fs::remove_dir_all(dst)
-            .map_err(|e| format!("cannot clear {}: {e}", dst.display()))?;
-    }
-    let mut count = 0;
-    copy_replacing(template, dst, crate_name, &mut count)?;
-    Ok(count)
-}
+/// Deterministic prompt assembly. The template is included so a live agent
+/// has the same source material the offline template client renders.
+fn build_prompt(context: &Context, templates: &Path) -> Result<String, String> {
+    let mut prompt = String::new();
+    prompt.push_str("Build the complete project described below.\n");
+    let _ = writeln!(prompt, "\n# Task\nTitle: {}", context.title);
+    let _ = writeln!(prompt, "Project: {}", context.project);
+    let _ = writeln!(prompt, "\n## Goal\n{}", context.goal.trim());
+    push_list(&mut prompt, "Acceptance", &context.acceptance);
+    push_list(&mut prompt, "Constraints", &context.constraints);
+    push_list(&mut prompt, "Non-goals", &context.non_goals);
+    push_list(&mut prompt, "Context", &context.context);
+    push_list(&mut prompt, "Open questions", &context.open_questions);
 
-fn copy_replacing(
-    src: &Path,
-    dst: &Path,
-    crate_name: &str,
-    count: &mut usize,
-) -> Result<(), String> {
-    fs::create_dir_all(dst).map_err(|e| format!("cannot create {}: {e}", dst.display()))?;
-    let entries = fs::read_dir(src).map_err(|e| format!("cannot read {}: {e}", src.display()))?;
-    for entry in entries {
-        let entry = entry.map_err(|e| format!("cannot read {}: {e}", src.display()))?;
-        let from = entry.path();
-        let to = dst.join(entry.file_name());
-        let file_type = entry
-            .file_type()
-            .map_err(|e| format!("cannot stat {}: {e}", from.display()))?;
-        if file_type.is_dir() {
-            copy_replacing(&from, &to, crate_name, count)?;
-        } else if file_type.is_file() {
-            let text = fs::read_to_string(&from)
-                .map_err(|e| format!("cannot read {}: {e}", from.display()))?;
-            let rendered = text.replace("{{crate_name}}", crate_name);
-            fs::write(&to, rendered)
-                .map_err(|e| format!("cannot write {}: {e}", to.display()))?;
-            *count += 1;
+    if templates.is_dir() {
+        let files = llm::read_template_files(templates, &context.project)?;
+        if !files.is_empty() {
+            prompt.push_str(
+                "\n# Reference template\nThe project starts from these files. Keep the structure unless the task requires otherwise.\n",
+            );
+            for (path, content) in files {
+                let _ = writeln!(prompt, "\n--- {path} ---\n{content}");
+            }
         }
     }
-    Ok(())
+
+    prompt.push_str(
+        "\n# Output\nReturn one JSON object and nothing else:\n\
+         {\"files\": {\"relative/path\": \"file contents\"}}\n\
+         Every path must be relative, use `/`, and contain no `..`. Include every file the project needs.\n",
+    );
+    Ok(prompt)
+}
+
+fn push_list(prompt: &mut String, title: &str, items: &[String]) {
+    if items.is_empty() {
+        return;
+    }
+    let _ = writeln!(prompt, "\n## {title}");
+    for item in items {
+        let _ = writeln!(prompt, "- {item}");
+    }
+}
+
+/// Replace `project/` with the files the agent returned. Validation happens
+/// before the old tree is removed, so a bad manifest cannot destroy work.
+fn apply_manifest(manifest: &FileManifest, dst: &Path) -> Result<usize, String> {
+    manifest.validate()?;
+    if dst.exists() {
+        fs::remove_dir_all(dst).map_err(|e| format!("cannot clear {}: {e}", dst.display()))?;
+    }
+    fs::create_dir_all(dst).map_err(|e| format!("cannot create {}: {e}", dst.display()))?;
+    for (path, content) in &manifest.files {
+        let target = dst.join(path);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+        }
+        fs::write(&target, content)
+            .map_err(|e| format!("cannot write {}: {e}", target.display()))?;
+    }
+    Ok(manifest.files.len())
 }
 
 fn run_gate(gate_id: GateId, ctx: &ExecCtx) -> Result<Vec<Event>, String> {
@@ -287,24 +350,10 @@ fn git_attempt(events: &mut Vec<Event>, dir: &Path, args: &[&str]) -> Result<Run
     })
 }
 
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn fnv_is_stable() {
-        assert_eq!(fnv1a64(b""), 0xcbf2_9ce4_8422_2325);
-        assert_eq!(fnv1a64(b"a"), 0xaf63_dc4c_8601_ec8c);
-    }
+    use std::collections::BTreeMap;
 
     #[test]
     fn context_serializes_deterministically() {
@@ -318,30 +367,80 @@ mod tests {
         assert_eq!(context.project, "hello-there");
         assert_eq!(
             serde_json::to_string(&context).unwrap(),
-            r#"{"project":"hello-there","goal":"g","acceptance":["a"]}"#
+            r#"{"project":"hello-there","title":"Hello There","goal":"g","acceptance":["a"],"constraints":[],"non_goals":[],"context":[],"open_questions":[]}"#
         );
         assert_eq!(crate::machine::branch_name(&spec), "ev/hello-there");
     }
 
     #[test]
-    fn materialize_replaces_the_crate_name() {
-        let root = env::temp_dir().join(format!("evengate-test-{}", std::process::id()));
+    fn prompt_carries_the_spec_and_the_template() {
+        let root = env::temp_dir().join(format!("evengate-prompt-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let template = root.join("template");
-        let dst = root.join("out");
         fs::create_dir_all(template.join("src")).unwrap();
         fs::write(template.join("Cargo.toml"), "name = \"{{crate_name}}\"\n").unwrap();
-        fs::write(template.join("src/main.rs"), "// {{crate_name}}\n").unwrap();
-        let count = materialize(&template, &dst, "hello").unwrap();
-        assert_eq!(count, 2);
+        fs::write(template.join("src/main.rs"), "fn main() {}\n").unwrap();
+
+        let context = Context {
+            project: "hello".into(),
+            title: "Hello".into(),
+            goal: "make a crate".into(),
+            acceptance: vec!["it compiles".into()],
+            constraints: vec!["no crates".into()],
+            non_goals: Vec::new(),
+            context: Vec::new(),
+            open_questions: Vec::new(),
+        };
+        let prompt = build_prompt(&context, &template).unwrap();
+        assert!(prompt.contains("make a crate"));
+        assert!(prompt.contains("- it compiles"));
+        assert!(prompt.contains("- no crates"));
+        assert!(prompt.contains("--- src/main.rs ---\nfn main() {}"));
+        assert!(prompt.contains("name = \"hello\""));
+        assert!(prompt.contains("\"files\""));
+        assert!(!prompt.contains("{{crate_name}}"));
+        assert_eq!(prompt, build_prompt(&context, &template).unwrap());
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn apply_manifest_replaces_the_project_tree() {
+        let root = env::temp_dir().join(format!("evengate-apply-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let project = root.join("project");
+        fs::create_dir_all(project.join("old")).unwrap();
+        fs::write(project.join("old/stale.txt"), "stale").unwrap();
+
+        let mut files = BTreeMap::new();
+        files.insert("Cargo.toml".to_string(), "name = \"hello\"\n".to_string());
+        files.insert("src/main.rs".to_string(), "fn main() {}\n".to_string());
+        let manifest = FileManifest { files };
+
+        assert_eq!(apply_manifest(&manifest, &project).unwrap(), 2);
+        assert!(!project.join("old").exists());
         assert_eq!(
-            fs::read_to_string(dst.join("Cargo.toml")).unwrap(),
-            "name = \"hello\"\n"
+            fs::read_to_string(project.join("src/main.rs")).unwrap(),
+            "fn main() {}\n"
         );
-        assert_eq!(
-            fs::read_to_string(dst.join("src/main.rs")).unwrap(),
-            "// hello\n"
-        );
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn apply_manifest_rejects_traversal_before_touching_the_tree() {
+        let root = env::temp_dir().join(format!("evengate-traversal-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let project = root.join("project");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(project.join("keep.txt"), "keep").unwrap();
+
+        let mut files = BTreeMap::new();
+        files.insert("../escape.txt".to_string(), "x".to_string());
+        assert!(apply_manifest(&FileManifest { files }, &project).is_err());
+        assert!(project.join("keep.txt").exists());
+        assert!(!root.join("escape.txt").exists());
+
         fs::remove_dir_all(&root).unwrap();
     }
 }

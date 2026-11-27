@@ -46,6 +46,16 @@ pub enum AgentRole {
     Reviewer,
 }
 
+impl AgentRole {
+    pub fn slug(self) -> &'static str {
+        match self {
+            AgentRole::Planner => "planner",
+            AgentRole::Executor => "executor",
+            AgentRole::Reviewer => "reviewer",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GateId {

@@ -1,6 +1,8 @@
-# Evengate — Technical Specification v0.3
+# Evengate — Technical Specification v0.4
 
 > A deterministic, Rust-native software factory that builds and improves itself under human oversight, and later produces pet projects in a familiar way.
+
+**Changes from v0.3:** the model boundary is concrete — a JSON file-manifest agent protocol, an OpenAI-compatible `LiveClient` over `ureq`, a prompt-hash-checked `RecordedClient`, and the offline `TemplateClient` as the default (§7.5, ADR-0006).
 
 **Changes from v0.2:** concurrency settled as post-v1 task-level parallelism (§13.6, ADR-0005); no event-log rework required.
 
@@ -243,14 +245,30 @@ The executor must never mutate `State` directly. It only returns events.
 
 ```rust
 pub trait LlmClient {
-    fn complete(&self, req: LlmRequest) -> Result<LlmResponse>;
+    fn complete(&self, req: &LlmRequest) -> Result<LlmResponse, String>;
 }
 
-pub struct LiveClient { /* ureq + rustls */ }
-pub struct RecordedClient { /* replays from event log */ }
+pub struct LlmRequest { pub role: AgentRole, pub prompt: String }
+pub struct LlmResponse { pub text: String, pub tokens: TokenUsage }
+
+pub struct LiveClient { /* ureq; OpenAI-compatible chat completions */ }
+pub struct RecordedClient { /* replays AgentResponded events by prompt hash */ }
+pub struct TemplateClient { /* offline: renders templates/ into a manifest */ }
 ```
 
-`RecordedClient` makes replay deterministic and offline. The `agent role → model` mapping is configuration, not code, so it can be changed without recompilation.
+**Agent protocol.** A model response is one JSON object mapping relative paths to file contents:
+
+```json
+{"files": {"src/main.rs": "fn main() {}\n"}}
+```
+
+The executor validates every path (relative, `/` separators, no `.`/`..`, bounded count and size), replaces `project/` with the manifest, and only then runs the gates. Prompt assembly is deterministic: the full spec and the reference template are rendered in declaration/sorted order, so the recorded prompt hash is reproducible.
+
+**LiveClient** speaks the OpenAI-compatible chat-completions wire format. URL, key, per-role model, timeout, and optional token cap come from the environment — `EVENGATE_LLM_URL`, `EVENGATE_LLM_API_KEY`, `EVENGATE_MODEL_PLANNER|EXECUTOR|REVIEWER` (fallback `EVENGATE_MODEL`), `EVENGATE_LLM_TIMEOUT_SECS`, `EVENGATE_LLM_MAX_TOKENS`. The wire format is fixed; the vendor is not.
+
+**Client selection.** `EVENGATE_LLM=template|live|recorded`. Unset means `live` when `EVENGATE_LLM_URL` is set, otherwise `template`. `TemplateClient` is the deterministic offline agent: it renders `templates/bin` the same way the seed kernel did, so the hello scenario stays reproducible without credentials.
+
+**RecordedClient** reconstructs `AgentInvoked` → `AgentResponded` pairs from the log in order and refuses a request whose role or prompt hash differs. A changed input therefore fails loudly instead of consuming an answer to a different question. Live responses are stored verbatim in `AgentResponded`, so the event log is sufficient to reconstruct what the model returned. `ev replay` itself remains a pure fold and never calls the network.
 
 ### 7.6 `gate.rs` — the quality barrier
 
@@ -360,8 +378,8 @@ If `Goal`, `Acceptance`, or `Constraints` is missing, the spec is rejected at `T
 | `serde` | Derive macros for `Event`, `Command`, `State`. Hand-rolling is error-prone. |
 | `serde_json` | JSONL encoding. Non-negotiable. |
 | `ureq` | Blocking HTTP client for LLM API. Replaces `reqwest` + `tokio`. |
-| `rustls` | TLS without OpenSSL. |
-| `webpki-roots` | Embedded trust store. No system CA dependency. |
+| `rustls` *(via `ureq`)* | TLS without OpenSSL; enabled by `ureq`'s default `rustls` feature, not a direct dependency. |
+| `webpki-roots` *(via `ureq`)* | Embedded trust store; enabled with `ureq`'s `rustls` feature. No system CA dependency. |
 | `anyhow` | Error propagation. Reduces boilerplate in `executor.rs` |
 | `toml` *(optional)* | Only if config files become necessary. Env vars otherwise. |
 
@@ -465,6 +483,8 @@ Open design questions keep stable numbers. A resolved question records its answe
 
 ### 13.1 LLM provider and model per role
 Planning, executing, and reviewing may use different models. Which, and at what budget?
+
+**Wire format settled by ADR-0006:** `LiveClient` speaks OpenAI-compatible chat completions, with the URL, key, and model per role supplied by the environment. The provider and budget are therefore configuration and remain open; no provider is wired into the code.
 
 ### 13.2 Sandbox choice on the target platform
 `bwrap` (Linux-only, lightweight) vs `docker` (cross-platform, heavier). Pick one for v0.

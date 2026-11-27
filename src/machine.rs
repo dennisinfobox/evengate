@@ -13,16 +13,26 @@ pub const MAX_GATE_ATTEMPTS: u32 = 2;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Context {
     pub project: String,
+    pub title: String,
     pub goal: String,
     pub acceptance: Vec<String>,
+    pub constraints: Vec<String>,
+    pub non_goals: Vec<String>,
+    pub context: Vec<String>,
+    pub open_questions: Vec<String>,
 }
 
 impl Context {
     pub fn from_spec(spec: &Spec) -> Self {
         Context {
             project: spec::slug(&spec.title),
+            title: spec.title.clone(),
             goal: spec.goal.clone(),
             acceptance: spec.acceptance.clone(),
+            constraints: spec.constraints.clone(),
+            non_goals: spec.non_goals.clone(),
+            context: spec.context.clone(),
+            open_questions: spec.open_questions.clone(),
         }
     }
 }
