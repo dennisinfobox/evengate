@@ -48,13 +48,13 @@ Environment: `EVENGATE_SANDBOX_IMAGE`, `EVENGATE_SANDBOX_TIMEOUT_SECS`, `EVENGAT
 
 Gate containers run read-only with no network, a read-only project mount, a 1 GiB executable `/tmp`, dropped capabilities, `no-new-privileges`, and the memory/PID/CPU caps above.
 
-The executing agent defaults to the offline `TemplateClient`. Set `EVENGATE_LLM_URL` (an OpenAI-compatible chat-completions endpoint) to switch to `LiveClient`; `EVENGATE_LLM=template|live|recorded` overrides the choice. Live mode reads `EVENGATE_LLM_API_KEY`, `EVENGATE_MODEL_EXECUTOR`/`_PLANNER`/`_REVIEWER` (fallback `EVENGATE_MODEL`), `EVENGATE_LLM_TIMEOUT_SECS`, and `EVENGATE_LLM_MAX_TOKENS`.
+The executing agent defaults to the offline `TemplateClient`. Set `EVENGATE_LLM_URL` (an OpenAI-compatible chat-completions endpoint) to switch to `LiveClient`; `EVENGATE_LLM=template|live|recorded` overrides the choice. Live requests ask for a JSON object (`response_format`), so a model cannot return an unescaped-quote reply. Live mode reads `EVENGATE_LLM_API_KEY`, `EVENGATE_MODEL_EXECUTOR`/`_PLANNER`/`_REVIEWER` (fallback `EVENGATE_MODEL`), `EVENGATE_LLM_TIMEOUT_SECS`, and `EVENGATE_LLM_MAX_TOKENS`.
 
 The `ReviewAgent` gate is mandatory and needs a model. With no endpoint configured, `ev run` executes the template agent and the three deterministic gates, then stops at the review gate with an actionable error; re-run with `EVENGATE_LLM_URL` set to finish the review and open the PR. `ev replay` is always offline.
 
 When a gate blocks a task, `ev revise` re-runs the executor with the failing verdicts, any human guidance, and the current project tree, then reruns every gate (at most two revisions). `ev abandon` ends a blocked task without a PR.
 
-The review agent also returns 3–5 lessons. The executor writes them to `lessons/<task-id>.md`, and the next executor prompt includes the five most recent lesson files; the current spec always wins over inherited advice.
+The review agent also returns 3–5 lessons. The executor writes them to `lessons/<task-id>.md`; both the next executor and the next reviewer prompt include the five most recent lesson files, and the reviewer is asked to copy a still-applicable lesson verbatim. The current spec always wins over inherited advice.
 
 Project-wide rules live in `rules/<project>.md`, where `<project>` is the spec title slug. They join both the executor and the reviewer prompt on every invocation; a missing or blank file adds nothing, and an unreadable file fails the run.
 

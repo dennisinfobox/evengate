@@ -289,11 +289,13 @@ fn build_review_prompt(
     context: &Context,
     project: &Path,
     rules: Option<&str>,
+    lessons: &[Lesson],
 ) -> Result<String, String> {
     let mut prompt =
         String::from("Review the complete project below before it is offered to the human owner.\n");
     push_task_spec(&mut prompt, context);
     prompt.push_str(&knowledge::rules_section(rules));
+    prompt.push_str(&knowledge::prompt_section(lessons));
     let files = read_project_files(project)?;
     prompt.push_str("\n# Project files\n");
     for (path, content) in files {
@@ -303,7 +305,7 @@ fn build_review_prompt(
         "\n# Output\nReturn one JSON object and nothing else:\n\
          {\"approve\": true, \"issues\": [], \"lessons\": [\"...\"]}\n\
          Set `approve` to false and list concrete, actionable issues when the project does not satisfy its acceptance criteria or violates a constraint. Review the code, not the process.\n\
-         Add 3–5 `lessons` bullets for the next task: what went wrong, or what to keep doing. Each lesson must be concrete and short.\n",
+         Add 3–5 `lessons` bullets for the next task: what went wrong, or what to keep doing. Each lesson must be concrete and short. When one of the earlier lessons still applies to this artifact, copy that lesson's text exactly; otherwise write a new lesson.\n",
     );
     Ok(prompt)
 }
@@ -447,7 +449,13 @@ fn run_gate(gate_id: GateId, ctx: &ExecCtx) -> Result<Vec<Event>, String> {
 /// response; an unusable answer becomes `NeedsHuman`, never a pass.
 fn run_review_gate(ctx: &ExecCtx) -> Result<Vec<Event>, String> {
     let rules = knowledge::read_rules(&ctx.rules_dir, &ctx.project_name)?;
-    let prompt = build_review_prompt(&ctx.context, &ctx.project_dir(), rules.as_deref())?;
+    let lessons = knowledge::recent_lessons(&ctx.lessons_dir, knowledge::RECENT_LESSONS)?;
+    let prompt = build_review_prompt(
+        &ctx.context,
+        &ctx.project_dir(),
+        rules.as_deref(),
+        &lessons,
+    )?;
     let request = LlmRequest {
         role: AgentRole::Reviewer,
         prompt,
@@ -897,16 +905,30 @@ mod tests {
             feedback: Vec::new(),
         };
         let rules = Some("No unsafe code.");
-        let prompt = build_review_prompt(&context, &project, rules).unwrap();
+        let lessons = vec![Lesson {
+            name: "sum-cli".into(),
+            body: "# Lessons — Sum CLI\n\n- Keep the usage message clear.".into(),
+        }];
+        let prompt = build_review_prompt(&context, &project, rules, &lessons).unwrap();
         assert!(prompt.contains("--- src/main.rs ---\nfn main() {}"));
         assert!(prompt.contains("--- Cargo.toml ---"));
         assert!(!prompt.contains(".git/HEAD"));
         assert!(!prompt.contains("target/debug/junk"));
         assert!(prompt.contains("# Project rules\n"));
         assert!(prompt.contains("No unsafe code."));
+        assert!(prompt.contains("# Lessons from previous tasks"));
+        assert!(prompt.contains("Keep the usage message clear."));
+        assert!(prompt.contains("copy that lesson's text exactly"));
         assert!(prompt.find("# Project rules").unwrap() < prompt.find("# Project files").unwrap());
+        assert!(
+            prompt.find("# Lessons from previous tasks").unwrap()
+                < prompt.find("# Project files").unwrap()
+        );
         assert!(prompt.contains("\"approve\""));
-        assert_eq!(prompt, build_review_prompt(&context, &project, rules).unwrap());
+        assert_eq!(
+            prompt,
+            build_review_prompt(&context, &project, rules, &lessons).unwrap()
+        );
 
         fs::remove_dir_all(&root).unwrap();
     }

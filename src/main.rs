@@ -389,7 +389,7 @@ fn print_blockers(state: &State) {
             println!("ev:   use `ev promote` or `ev dismiss` to decide");
         }
     }
-    if state.revisions >= machine::MAX_REVISIONS {
+    if state.revisions >= machine::MAX_REVISIONS && !state::all_mandatory_passed(state) {
         println!(
             "ev:   revision limit reached ({}); use `ev abandon` to stop",
             machine::MAX_REVISIONS

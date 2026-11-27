@@ -317,6 +317,7 @@ impl LlmClient for LiveClient {
                 },
             ],
             max_tokens: self.max_tokens,
+            response_format: ResponseFormat { kind: "json_object" },
         };
         let agent = ureq::Agent::config_builder()
             .timeout_global(Some(self.timeout))
@@ -374,6 +375,15 @@ struct ChatRequest<'a> {
     messages: Vec<ChatMessageIn<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u64>,
+    response_format: ResponseFormat,
+}
+
+/// Both roles must answer with a JSON object. Asking the server for JSON mode
+/// keeps local models from emitting unescaped quotes inside file contents.
+#[derive(Serialize)]
+struct ResponseFormat {
+    #[serde(rename = "type")]
+    kind: &'static str,
 }
 
 #[derive(Serialize)]
@@ -684,6 +694,7 @@ mod tests {
             assert_eq!(sent["model"], "test-model");
             assert_eq!(sent["messages"][0]["role"], "system");
             assert_eq!(sent["messages"][1]["content"], "hello prompt");
+            assert_eq!(sent["response_format"]["type"], "json_object");
             let response = format!(
                 "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
                 payload.len()

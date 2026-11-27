@@ -1,6 +1,8 @@
-# Evengate — Technical Specification v0.14
+# Evengate — Technical Specification v0.15
 
 > A deterministic, Rust-native software factory that builds and improves itself under human oversight, and later produces pet projects in a familiar way.
+
+**Changes from v0.14:** the review prompt now carries the five most recent lesson files and instructs verbatim reuse of a still-applicable lesson, so repetition is observable for promotion; `LiveClient` requests `response_format: {"type":"json_object"}` so a local model cannot return an unescaped-quote reply (§7.5, §7.8, ADR-0017, ADR-0018).
 
 **Changes from v0.13:** promotion treats paraphrased lessons as repetitions — stemmed content-token sets with a Dice threshold of 3/5 and a negation guard — instead of requiring identical text (§7.8, ADR-0016).
 
@@ -303,7 +305,7 @@ The executor validates every path (relative, `/` separators, no `.`/`..`, bounde
 
 The executor writes the lessons to `lessons/<task-id>.md`; the raw response remains the event-log record from which that file can be reconstructed.
 
-**LiveClient** speaks the OpenAI-compatible chat-completions wire format. URL, key, per-role model, timeout, and optional token cap come from the environment — `EVENGATE_LLM_URL`, `EVENGATE_LLM_API_KEY`, `EVENGATE_MODEL_PLANNER|EXECUTOR|REVIEWER` (fallback `EVENGATE_MODEL`), `EVENGATE_LLM_TIMEOUT_SECS`, `EVENGATE_LLM_MAX_TOKENS`. The wire format is fixed; the vendor is not.
+**LiveClient** speaks the OpenAI-compatible chat-completions wire format. URL, key, per-role model, timeout, and optional token cap come from the environment — `EVENGATE_LLM_URL`, `EVENGATE_LLM_API_KEY`, `EVENGATE_MODEL_PLANNER|EXECUTOR|REVIEWER` (fallback `EVENGATE_MODEL`), `EVENGATE_LLM_TIMEOUT_SECS`, `EVENGATE_LLM_MAX_TOKENS`. Every request sets `response_format: {"type":"json_object"}` because both roles must answer with one JSON object; a provider that ignores the field behaves as before. The wire format is fixed; the vendor is not.
 
 **Client selection.** `EVENGATE_LLM=template|live|recorded`. Unset means `live` when `EVENGATE_LLM_URL` is set, otherwise `template`. `TemplateClient` is the deterministic offline agent: it renders `templates/bin` the same way the seed kernel did, so the hello scenario stays reproducible without credentials.
 
@@ -376,7 +378,7 @@ Knowledge is **structured, versioned, and fed back into prompts**. Not a vector 
 - `rules/<project>.md`, when present, under the rules root (`rules/` by default, `EVENGATE_RULES_DIR` overrides),
 - the 5 most recent `lessons/*.md`, newest first by file modification time, ties broken by file name (recency, not similarity — a similarity index comes later).
 
-The prompt states that the current spec and constraints win over inherited lessons. Rules and lessons are read during prompt assembly, never cached in `State`, so a human edit applies to the next invocation. The same `# Project rules` section is given to the review agent, so a project rule is checked as well as prompted. The raw reviewer response recorded in `AgentResponded` is the event-log source for a lesson file, so `ev replay` remains a pure fold and `ev materialize` can rebuild the file. `codebase-map.md` joins the prompt once a planner consumes it; the lessons path is the v0 feedback loop.
+The prompt states that the current spec and constraints win over inherited lessons. Rules and lessons are read during prompt assembly, never cached in `State`, so a human edit applies to the next invocation. The same `# Project rules` section is given to the review agent, so a project rule is checked as well as prompted. The review agent also receives the same five most recent lesson files, with an instruction to copy a still-applicable lesson's text exactly instead of rewording it; repetition is therefore observable to the critic, not only to the executor. The raw reviewer response recorded in `AgentResponded` is the event-log source for a lesson file, so `ev replay` remains a pure fold and `ev materialize` can rebuild the file. `codebase-map.md` joins the prompt once a planner consumes it; the lessons path is the v0 feedback loop.
 
 **Promotion path:** after a review writes a lesson file, the executor groups lessons across `lessons/*.md`. Two bullets are the same lesson when their content-token sets reach a Dice coefficient of 3/5 after lowercasing, dropping stopwords and advice framing, and folding simple plurals; a negation on one side and not the other blocks the match. A group counts once per task file, not once per bullet. Its representative is the exact spelling found in the most files, ties broken by canonical key. The executor records a `LessonRepeated { lesson, text, count }` event for every group seen in at least three files that is not already covered by a bullet in `rules/<project>.md`; a promoted paraphrase also suppresses re-proposal. Matching is lexical, so a near-miss is proposed for human review, never auto-promoted.
 
