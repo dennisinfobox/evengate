@@ -288,6 +288,11 @@ fn promotion_decision(args: &[String], promote: bool) -> Result<(), String> {
             pending
                 .iter()
                 .position(|(pending_key, _)| pending_key == &key)
+                .or_else(|| {
+                    pending
+                        .iter()
+                        .position(|(pending_key, _)| knowledge::lessons_match(pending_key, &key))
+                })
                 .ok_or_else(|| {
                     format!(
                         "`{text}` is not a pending lesson; pending: {}",

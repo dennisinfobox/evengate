@@ -9,6 +9,28 @@ pub const RECENT_LESSONS: usize = 5;
 /// A lesson seen in this many tasks is proposed for promotion to `rules/`.
 pub const PROMOTION_THRESHOLD: u32 = 3;
 
+/// Two lessons are "the same" when their content-token Dice coefficient is at
+/// least `MATCH_NUMERATOR / MATCH_DENOMINATOR`. Integer arithmetic keeps the
+/// comparison exact.
+const MATCH_NUMERATOR: usize = 3;
+const MATCH_DENOMINATOR: usize = 5;
+
+/// Words that carry no lesson content: articles, prepositions, auxiliaries,
+/// and generic advice framing. Content words are compared after stemming.
+const STOPWORDS: [&str; 72] = [
+    "a", "an", "the", "and", "or", "but", "if", "then", "than", "so", "to", "of", "in", "on", "at",
+    "for", "with", "from", "by", "as", "is", "are", "was", "were", "be", "been", "being", "it",
+    "its", "this", "that", "these", "those", "you", "your", "we", "our", "i", "me", "my", "them",
+    "their", "they", "he", "she", "his", "her", "should", "must", "can", "could", "may", "might",
+    "will", "would", "do", "does", "did", "have", "has", "had", "ensure", "remember", "try",
+    "always", "keep", "use", "using", "make", "consider", "continue", "prefer",
+];
+
+/// Negations flip the meaning of otherwise similar advice, so a match requires
+/// both lessons to agree on whether one is present.
+const NEGATIONS: [&str; 5] = ["not", "no", "never", "avoid", "cannot"];
+
+
 /// A lessons file read back from disk. `name` is the file stem (the task id).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Lesson {
@@ -116,8 +138,9 @@ pub struct LessonCount {
     pub count: u32,
 }
 
-/// Stable identity for "the same lesson": bullet markers and whitespace are
-/// irrelevant, and ASCII case is ignored. Punctuation is preserved.
+/// Exact key for a lesson: bullet markers and whitespace are irrelevant, and
+/// ASCII case is ignored. Punctuation is preserved. `lessons_match` decides
+/// whether two different keys are the same advice.
 pub fn canonical_lesson(text: &str) -> String {
     let text = text.trim();
     let text = text
@@ -130,47 +153,134 @@ pub fn canonical_lesson(text: &str) -> String {
         .to_ascii_lowercase()
 }
 
-/// Count each lesson once per task file, across every `*.md` in the lessons
-/// directory. A missing directory is an empty knowledge base.
-pub fn count_lessons(dir: &Path) -> Result<BTreeMap<String, LessonCount>, String> {
-    let mut counts: BTreeMap<String, LessonCount> = BTreeMap::new();
-    if !dir.is_dir() {
-        return Ok(counts);
+/// True when two lessons give the same advice, even if the wording differs.
+/// Comparison is lexical: content tokens are stemmed and compared as sets, and
+/// the Dice coefficient must reach `MATCH_NUMERATOR / MATCH_DENOMINATOR`.
+/// Lessons that disagree on negation never match. Promotion stays a human
+/// decision, so a near-miss is proposed, not applied.
+pub fn lessons_match(a: &str, b: &str) -> bool {
+    let left = lesson_tokens(a);
+    let right = lesson_tokens(b);
+    if left.is_empty() || right.is_empty() {
+        return false;
     }
-    let mut paths: Vec<PathBuf> = Vec::new();
-    let entries = fs::read_dir(dir)
-        .map_err(|e| format!("cannot read lessons directory {}: {e}", dir.display()))?;
-    for entry in entries {
-        let entry = entry.map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
-        let path = entry.path();
-        if path.is_file() && path.extension().and_then(|ext| ext.to_str()) == Some("md") {
-            paths.push(path);
-        }
+    let left_negated = left.iter().any(|token| NEGATIONS.contains(&token.as_str()));
+    let right_negated = right.iter().any(|token| NEGATIONS.contains(&token.as_str()));
+    if left_negated != right_negated {
+        return false;
     }
-    paths.sort();
+    let common = left.intersection(&right).count();
+    2 * common * MATCH_DENOMINATOR >= (left.len() + right.len()) * MATCH_NUMERATOR
+}
 
-    for path in paths {
-        let body = fs::read_to_string(&path)
-            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-        let mut seen = BTreeSet::new();
-        for line in body.lines() {
-            let trimmed = line.trim();
-            let bullet = trimmed
-                .strip_prefix("- ")
-                .or_else(|| trimmed.strip_prefix("* "));
-            let Some(bullet) = bullet else { continue };
-            let key = canonical_lesson(bullet);
-            if key.is_empty() || !seen.insert(key.clone()) {
-                continue;
+fn lesson_tokens(text: &str) -> BTreeSet<String> {
+    canonical_lesson(text)
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty() && !STOPWORDS.contains(token))
+        .map(stem)
+        .collect()
+}
+
+/// Minimal English plural folding. It is deliberately conservative: a wrong
+/// stem can merge unrelated lessons, so only clear plural endings move.
+fn stem(token: &str) -> String {
+    if token.len() > 5 && token.ends_with("ies") {
+        return format!("{}y", &token[..token.len() - 3]);
+    }
+    if token.len() > 4 && token.ends_with("sses") {
+        return token[..token.len() - 2].to_string();
+    }
+    if token.len() > 3 && token.ends_with('s') && !token.ends_with("ss") {
+        return token[..token.len() - 1].to_string();
+    }
+    token.to_string()
+}
+
+/// Count each lesson once per task file, across every `*.md` in the lessons
+/// directory. Paraphrases collapse into one group: the representative is the
+/// exact spelling with the most files, ties broken by canonical key, and the
+/// count is the number of distinct files containing any member. A missing
+/// directory is an empty knowledge base.
+pub fn count_lessons(dir: &Path) -> Result<BTreeMap<String, LessonCount>, String> {
+    let mut occurrences: BTreeMap<String, (String, BTreeSet<PathBuf>)> = BTreeMap::new();
+    if dir.is_dir() {
+        let mut paths: Vec<PathBuf> = Vec::new();
+        let entries = fs::read_dir(dir)
+            .map_err(|e| format!("cannot read lessons directory {}: {e}", dir.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
+            let path = entry.path();
+            if path.is_file() && path.extension().and_then(|ext| ext.to_str()) == Some("md") {
+                paths.push(path);
             }
-            let entry = counts.entry(key).or_insert_with(|| LessonCount {
-                text: bullet.split_whitespace().collect::<Vec<_>>().join(" "),
-                count: 0,
-            });
-            entry.count = entry.count.saturating_add(1);
         }
+        paths.sort();
+
+        for path in paths {
+            let body = fs::read_to_string(&path)
+                .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+            let mut seen = BTreeSet::new();
+            for line in body.lines() {
+                let Some(bullet) = lesson_bullet(line) else {
+                    continue;
+                };
+                let key = canonical_lesson(bullet);
+                if key.is_empty() || !seen.insert(key.clone()) {
+                    continue;
+                }
+                occurrences
+                    .entry(key)
+                    .or_insert_with(|| (clean_text(bullet), BTreeSet::new()))
+                    .1
+                    .insert(path.clone());
+            }
+        }
+    }
+
+    let mut order: Vec<&String> = occurrences.keys().collect();
+    order.sort_by(|a, b| {
+        occurrences[*b]
+            .1
+            .len()
+            .cmp(&occurrences[*a].1.len())
+            .then_with(|| a.cmp(b))
+    });
+    let mut groups: Vec<(String, BTreeSet<PathBuf>)> = Vec::new();
+    for key in order {
+        let files = &occurrences[key].1;
+        if let Some((_, group_files)) = groups
+            .iter_mut()
+            .find(|group| lessons_match(group.0.as_str(), key))
+        {
+            group_files.extend(files.iter().cloned());
+        } else {
+            groups.push((key.clone(), files.clone()));
+        }
+    }
+
+    let mut counts = BTreeMap::new();
+    for (representative, files) in groups {
+        let text = occurrences[&representative].0.clone();
+        counts.insert(
+            representative,
+            LessonCount {
+                text,
+                count: files.len() as u32,
+            },
+        );
     }
     Ok(counts)
+}
+
+fn lesson_bullet(line: &str) -> Option<&str> {
+    let trimmed = line.trim();
+    trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix("* "))
+}
+
+fn clean_text(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Canonical lessons already present as bullets in a rules file.
@@ -178,11 +288,7 @@ pub fn rule_lessons(rules: Option<&str>) -> BTreeSet<String> {
     let mut lessons = BTreeSet::new();
     if let Some(text) = rules {
         for line in text.lines() {
-            let trimmed = line.trim();
-            let bullet = trimmed
-                .strip_prefix("- ")
-                .or_else(|| trimmed.strip_prefix("* "));
-            if let Some(bullet) = bullet {
+            if let Some(bullet) = lesson_bullet(line) {
                 let key = canonical_lesson(bullet);
                 if !key.is_empty() {
                     lessons.insert(key);
@@ -206,7 +312,10 @@ pub fn append_rule(dir: &Path, project: &str, lesson: &str) -> Result<PathBuf, S
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(error) => return Err(format!("cannot read {}: {error}", path.display())),
     };
-    if rule_lessons(Some(existing.as_str())).contains(&canonical_lesson(&lesson)) {
+    if rule_lessons(Some(existing.as_str()))
+        .iter()
+        .any(|rule| lessons_match(rule, &lesson))
+    {
         return Ok(path);
     }
     fs::create_dir_all(dir)
@@ -381,6 +490,67 @@ mod tests {
     }
 
     #[test]
+    fn paraphrases_count_as_one_lesson_with_a_stable_representative() {
+        let dir = temp_dir("paraphrase");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("a.md"),
+            "# Lessons — A\n\n- Ensure that the usage message is consistent and provides clear instructions.\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("b.md"),
+            "# Lessons — B\n\n- Keep the usage message consistent and clear.\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("c.md"),
+            "# Lessons — C\n\n- Print a consistent usage message with clear instructions.\n",
+        )
+        .unwrap();
+
+        let counts = count_lessons(&dir).unwrap();
+        assert_eq!(counts.len(), 1);
+        let key = canonical_lesson(
+            "Ensure that the usage message is consistent and provides clear instructions.",
+        );
+        assert_eq!(counts[&key].count, 3);
+        assert_eq!(
+            counts[&key].text,
+            "Ensure that the usage message is consistent and provides clear instructions."
+        );
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn unrelated_or_opposite_lessons_stay_separate() {
+        assert!(!lessons_match(
+            "Keep it small.",
+            "Use cargo clippy with -D warnings."
+        ));
+        assert!(!lessons_match("Do not use unsafe code.", "Use unsafe code."));
+        assert!(!lessons_match("Keep it small.", "Do not keep it small."));
+
+        let dir = temp_dir("separate");
+        fs::create_dir_all(&dir).unwrap();
+        for (name, line) in [
+            ("a.md", "Keep it small."),
+            ("b.md", "Use cargo clippy with -D warnings."),
+            ("c.md", "Do not use unsafe code."),
+            ("d.md", "Use unsafe code."),
+        ] {
+            fs::write(dir.join(name), format!("# Lessons\n\n- {line}\n")).unwrap();
+        }
+        let counts = count_lessons(&dir).unwrap();
+        assert_eq!(counts.len(), 4);
+        assert_eq!(counts[&canonical_lesson("Do not use unsafe code.")].count, 1);
+        assert_eq!(counts[&canonical_lesson("Use unsafe code.")].count, 1);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn append_rule_creates_appends_and_dedupes() {
         let dir = temp_dir("append-rule");
         let path = append_rule(&dir, "hello", "Keep it small.").unwrap();
@@ -399,6 +569,12 @@ mod tests {
         let body = fs::read_to_string(&path).unwrap();
         assert_eq!(body.matches("Keep it small.").count(), 1);
         assert!(body.ends_with("- No unsafe code.\n"));
+
+        append_rule(&dir, "hello", "Keep dependencies minimal.").unwrap();
+        append_rule(&dir, "hello", "Keep the dependencies minimal.").unwrap();
+        let body = fs::read_to_string(&path).unwrap();
+        assert_eq!(body.matches("dependencies").count(), 1);
+        assert!(body.ends_with("- Keep dependencies minimal.\n"));
 
         fs::remove_dir_all(&dir).unwrap();
     }

@@ -1,6 +1,8 @@
-# Evengate — Technical Specification v0.13
+# Evengate — Technical Specification v0.14
 
 > A deterministic, Rust-native software factory that builds and improves itself under human oversight, and later produces pet projects in a familiar way.
+
+**Changes from v0.13:** promotion treats paraphrased lessons as repetitions — stemmed content-token sets with a Dice threshold of 3/5 and a negation guard — instead of requiring identical text (§7.8, ADR-0016).
 
 **Changes from v0.12:** the replay guarantee is scoped to the reducer that produced the snapshot; `tasks/hello` is frozen as seed-run evidence and is expected to replay with the pre-`ReviewAgent` anomaly (§6.3, §14, ADR-0015).
 
@@ -376,7 +378,7 @@ Knowledge is **structured, versioned, and fed back into prompts**. Not a vector 
 
 The prompt states that the current spec and constraints win over inherited lessons. Rules and lessons are read during prompt assembly, never cached in `State`, so a human edit applies to the next invocation. The same `# Project rules` section is given to the review agent, so a project rule is checked as well as prompted. The raw reviewer response recorded in `AgentResponded` is the event-log source for a lesson file, so `ev replay` remains a pure fold and `ev materialize` can rebuild the file. `codebase-map.md` joins the prompt once a planner consumes it; the lessons path is the v0 feedback loop.
 
-**Promotion path:** after a review writes a lesson file, the executor counts each lesson once per task file across `lessons/*.md`. Bullet markers and whitespace are ignored and ASCII case is folded, so "Keep it small." and "- keep it  small." are the same lesson. The executor records a `LessonRepeated { lesson, text, count }` event for every lesson seen at least three times that is not already a bullet in `rules/<project>.md`.
+**Promotion path:** after a review writes a lesson file, the executor groups lessons across `lessons/*.md`. Two bullets are the same lesson when their content-token sets reach a Dice coefficient of 3/5 after lowercasing, dropping stopwords and advice framing, and folding simple plurals; a negation on one side and not the other blocks the match. A group counts once per task file, not once per bullet. Its representative is the exact spelling found in the most files, ties broken by canonical key. The executor records a `LessonRepeated { lesson, text, count }` event for every group seen in at least three files that is not already covered by a bullet in `rules/<project>.md`; a promoted paraphrase also suppresses re-proposal. Matching is lexical, so a near-miss is proposed for human review, never auto-promoted.
 
 Once every mandatory gate passes, `machine.rs` pauses before `OpenPullRequest` and emits `Command::RequestHumanReview` with artifact kind `promotion` and the proposal in `detail`. The human decides:
 

@@ -510,7 +510,10 @@ fn repetition_events(
     Ok(counts
         .into_iter()
         .filter(|(lesson, counted)| {
-            counted.count >= knowledge::PROMOTION_THRESHOLD && !known.contains(lesson)
+            counted.count >= knowledge::PROMOTION_THRESHOLD
+                && !known
+                    .iter()
+                    .any(|rule| knowledge::lessons_match(rule, lesson))
         })
         .map(|(lesson, counted)| Event::LessonRepeated {
             lesson,
@@ -1070,6 +1073,62 @@ mod tests {
         }
 
         knowledge::append_rule(&rules, "hello", "Keep it small.").unwrap();
+        assert!(repetition_events(&lessons, &rules, "hello")
+            .unwrap()
+            .is_empty());
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn repetition_events_group_paraphrases_and_skip_similar_rules() {
+        let root = materialize_dir("paraphrase-repetition");
+        let lessons = root.join("lessons");
+        let rules = root.join("rules");
+        fs::create_dir_all(&lessons).unwrap();
+        for (name, line) in [
+            (
+                "a.md",
+                "Ensure that the usage message is consistent and provides clear instructions.",
+            ),
+            ("b.md", "Keep the usage message consistent and clear."),
+        ] {
+            fs::write(lessons.join(name), format!("# Lessons\n\n- {line}\n")).unwrap();
+        }
+        assert!(repetition_events(&lessons, &rules, "hello")
+            .unwrap()
+            .is_empty());
+
+        fs::write(
+            lessons.join("c.md"),
+            "# Lessons\n\n- Print a consistent usage message with clear instructions.\n",
+        )
+        .unwrap();
+        let events = repetition_events(&lessons, &rules, "hello").unwrap();
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            Event::LessonRepeated {
+                lesson,
+                text,
+                count,
+            } => {
+                assert_eq!(
+                    lesson,
+                    &knowledge::canonical_lesson(
+                        "Ensure that the usage message is consistent and provides clear instructions."
+                    )
+                );
+                assert_eq!(
+                    text,
+                    "Ensure that the usage message is consistent and provides clear instructions."
+                );
+                assert_eq!(*count, 3);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        knowledge::append_rule(&rules, "hello", "Keep the usage message consistent and clear.")
+            .unwrap();
         assert!(repetition_events(&lessons, &rules, "hello")
             .unwrap()
             .is_empty());
