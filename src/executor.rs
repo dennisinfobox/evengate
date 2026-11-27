@@ -129,8 +129,15 @@ fn invoke_agent(
 /// has the same source material the offline template client renders.
 fn build_prompt(context: &Context, templates: &Path) -> Result<String, String> {
     let mut prompt = String::new();
-    prompt.push_str("Build the complete project described below.\n");
+    if context.feedback.is_empty() {
+        prompt.push_str("Build the complete project described below.\n");
+    } else {
+        prompt.push_str(
+            "Revise the existing project described below. Every issue under Revision feedback must be fixed.\n",
+        );
+    }
     push_task_spec(&mut prompt, context);
+    push_list(&mut prompt, "Revision feedback", &context.feedback);
 
     if templates.is_dir() {
         let files = llm::read_template_files(templates, &context.project)?;
@@ -491,7 +498,7 @@ mod tests {
         assert_eq!(context.project, "hello-there");
         assert_eq!(
             serde_json::to_string(&context).unwrap(),
-            r#"{"project":"hello-there","title":"Hello There","goal":"g","acceptance":["a"],"constraints":[],"non_goals":[],"context":[],"open_questions":[]}"#
+            r#"{"project":"hello-there","title":"Hello There","goal":"g","acceptance":["a"],"constraints":[],"non_goals":[],"context":[],"open_questions":[],"feedback":[]}"#
         );
         assert_eq!(crate::machine::branch_name(&spec), "ev/hello-there");
     }
@@ -514,6 +521,7 @@ mod tests {
             non_goals: Vec::new(),
             context: Vec::new(),
             open_questions: Vec::new(),
+            feedback: Vec::new(),
         };
         let prompt = build_prompt(&context, &template).unwrap();
         assert!(prompt.contains("make a crate"));
@@ -526,6 +534,29 @@ mod tests {
         assert_eq!(prompt, build_prompt(&context, &template).unwrap());
 
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn revision_prompt_carries_the_gate_failures() {
+        let spec = Spec {
+            title: "Hello".into(),
+            goal: "g".into(),
+            acceptance: vec!["a".into()],
+            ..Spec::default()
+        };
+        let mut failures = BTreeMap::new();
+        failures.insert(
+            GateId::Compiles,
+            GateResult::Fail {
+                reason: "boom".into(),
+            },
+        );
+        let context = Context::from_revision(&spec, &failures, Some("keep it small"));
+        let prompt = build_prompt(&context, Path::new("no-such-template-dir")).unwrap();
+        assert!(prompt.starts_with("Revise the existing project"));
+        assert!(prompt.contains("## Revision feedback"));
+        assert!(prompt.contains("- cargo check failed: boom"));
+        assert!(prompt.contains("- human guidance: keep it small"));
     }
 
     #[test]
@@ -590,6 +621,7 @@ mod tests {
             non_goals: Vec::new(),
             context: Vec::new(),
             open_questions: Vec::new(),
+            feedback: Vec::new(),
         };
         let prompt = build_review_prompt(&context, &project).unwrap();
         assert!(prompt.contains("--- src/main.rs ---\nfn main() {}"));

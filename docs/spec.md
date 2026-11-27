@@ -1,6 +1,8 @@
-# Evengate — Technical Specification v0.5
+# Evengate — Technical Specification v0.6
 
 > A deterministic, Rust-native software factory that builds and improves itself under human oversight, and later produces pet projects in a familiar way.
+
+**Changes from v0.5:** gate-blocked tasks have a bounded revision path — `ev revise` re-invokes the executor with the failing gate verdicts and optional human guidance, and `ev abandon` ends a blocked task without opening a PR (§7.2, §7.3, §7.6, ADR-0008).
 
 **Changes from v0.4:** the `ReviewAgent` gate is mandatory and LLM-backed; it reviews the project tree after the deterministic gates and stops for a human when approval is withheld (§7.6, ADR-0007).
 
@@ -188,6 +190,8 @@ pub enum Event {
     GateEvaluated { gate: GateId, result: GateResult },
     HumanApproved { reviewer: String },
     HumanRejected { reviewer: String, reason: String },
+    RevisionRequested { reviewer: String, guidance: Option<String> },
+    HumanAbandoned { reviewer: String, reason: String },
     PrOpened { url: String },
     Merged { commit: String },
     TaskAbandoned { reason: String },
@@ -201,7 +205,7 @@ All events are serialized as JSON Lines with stable field ordering. The log is t
 
 ```rust
 pub struct State {
-    pub phase: Phase,           // Drafting, Generating, Verifying, Reviewing, Merged, ...
+    pub phase: Phase,           // Drafting, Generating, Verifying, Revising, Reviewing, Merged, ...
     pub spec: Spec,
     pub artifacts: Vec<ArtifactRef>,
     pub gate_results: HashMap<GateId, GateResult>,
@@ -232,6 +236,8 @@ pub enum Command {
 - `InvokeAgent` is never issued for a role that already produced a response in the current phase without an intervening gate.
 - `Finalize { Merged }` is unreachable unless every mandatory gate passed **and** a `HumanApproved` event exists.
 - No command is issued twice in a row with identical parameters (loop protection).
+
+**Revision path.** A gate that still fails after `MAX_GATE_ATTEMPTS`, or a review rejection, leaves the task in `Verifying` with `RequestHumanReview`. The human may then issue `RevisionRequested`, which is accepted only in `Verifying` with at least one non-passing verdict. The reducer snapshots those verdicts and the optional guidance into `State`, increments the revision counter, clears every gate verdict and attempt counter, and enters `Revising`. `next_command` then issues one `InvokeAgent` whose `Context` carries the failures; the response moves the task to `Generating` and back to `Verifying`, so every gate runs again on the new tree. Revisions are capped at `MAX_REVISIONS` (2); at the cap the machine requests a human again. `HumanAbandoned` ends the task from any non-terminal phase, while `TaskAbandoned` remains the consequence of rejecting a PR.
 
 ### 7.4 `executor.rs` — the impure boundary
 
@@ -301,7 +307,7 @@ pub trait Gate {
 
 **Rule:** the executing agent has no mechanism to mark a gate as passed. Gates own their verdicts.
 
-`Compiles`, `TestsPass`, `LintsClean`, and `ReviewAgent` are the mandatory v0 gates, in that order. The review agent runs on the artifact the deterministic gates accepted, records its request and raw response as `Reviewer` events, and maps a withheld approval to `Fail` with the issues as the reason. A rejection stops the run for a human immediately rather than re-asking the same tree; an unusable verdict becomes `NeedsHuman`. Review requires a model: with the offline `TemplateClient` the run stops at this gate with an actionable error and resumes once a model is configured. The executor cannot pass this gate on the reviewer's behalf.
+`Compiles`, `TestsPass`, `LintsClean`, and `ReviewAgent` are the mandatory v0 gates, in that order. The review agent runs on the artifact the deterministic gates accepted, records its request and raw response as `Reviewer` events, and maps a withheld approval to `Fail` with the issues as the reason. A rejection stops the run for a human immediately rather than re-asking the same tree; an unusable verdict becomes `NeedsHuman`. Review requires a model: with the offline `TemplateClient` the run stops at this gate with an actionable error and resumes once a model is configured. The executor cannot pass this gate on the reviewer's behalf. From a blocked state the human can `ev revise` (executor re-runs with the verdicts) or `ev abandon`; see §7.3.
 
 ### 7.7 `sandbox.rs` — process isolation
 
@@ -429,6 +435,7 @@ A task is a **self-improvement task** if its spec targets a file under `src/` of
 - No command repeated with identical arguments back-to-back.
 - Maximum N agent invocations per phase (default: 5).
 - Maximum N retries per gate (default: 2). After that, `NeedsHuman`.
+- Maximum N human-requested revisions per task (default: 2). Each revision resets the per-gate attempt counter, so total executor retries stay bounded.
 
 ---
 

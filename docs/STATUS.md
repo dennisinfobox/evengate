@@ -2,24 +2,23 @@
 
 Last updated: 2026-11-27
 
-**Phase:** 1 — First tasks (week 5–6). The deterministic gates and the LLM-backed review gate now form one pipeline; human approval remains the final gate.
+**Phase:** 1 — First tasks (week 5–6). The factory can now recover from a blocked gate inside the event log: a human asks for a bounded revision, the executor re-runs with the verdicts, and every gate re-judges the new tree.
 
 **Done since last handoff:**
-- `ReviewAgent` is the fourth mandatory gate (`gate::MANDATORY_V0`), after `Compiles`, `TestsPass`, and `LintsClean`.
-- It reviews the real project tree (full spec + all text files, `.git`/`target` excluded, sorted, 256 KiB per-file cap) using the `Reviewer` role, records `AgentInvoked`/`AgentResponded` with token usage, and maps `{approve, issues[]}` to `Pass`/`Fail`. A malformed verdict becomes `NeedsHuman`, never a pass.
-- A withheld approval stops the run immediately with the issues as the fail reason; the same artifact is never re-sent to the reviewer. The reducer accepts reviewer turns during `Verifying` without anomalies while executor turns stay phase-checked.
-- Offline template mode cannot pass the review gate: it stops there with an actionable error, and the task resumes at that gate once a model is configured.
-- Spec bumped to v0.5 (§7.6); ADR-0007 recorded; README explains the mandatory review.
-- Checks pass: `cargo check --locked`, `cargo test --locked` (47 tests), `cargo clippy --locked -- -D warnings`.
-- End-to-end against a local OpenAI-compatible stub: approve → 4 gates pass → PR opened; reject → review `Fail` with reason, no PR; offline run → review error → resume with the model → PR. Both logs replay byte-identically (22 and 12 events). Token usage recorded for both roles.
+- Gate-failure recovery: `ev revise <task> --reviewer <name> [--reason <text>]` records `RevisionRequested`, snapshots the non-passing verdicts plus guidance into `State`, clears all gate results and attempt counters, and enters `Revising`.
+- `next_command` re-invokes the executor once with a `Context` whose new `feedback` field lists the failing gates and human guidance; the prompt renders it under `# Revision feedback`.
+- Revisions are capped at `MAX_REVISIONS = 2`; the machine also refuses to invoke beyond the cap, so a hand-edited log cannot loop. Clearing attempts is safe because the revision count bounds total retries.
+- `ev abandon` records `HumanAbandoned` and ends any non-terminal task without a PR; `TaskAbandoned` still follows a PR rejection. `ev run` now prints the blocking gate verdicts.
+- Spec bumped to v0.6 (§7.2, §7.3, §7.6, §10.3); ADR-0008 recorded; README documents both recovery commands.
+- Checks pass: `cargo check --locked`, `cargo test --locked` (56 tests), `cargo clippy --locked -- -D warnings`.
+- End-to-end against a local OpenAI-compatible stub: first manifest fails `cargo check` twice → blocked with the reason; `ev revise` with guidance → all four gates pass → PR; `ev approve` → merged; the 32-event log replays byte-identically. A synthetic blocked log replays identically after `ev abandon`; `revise`/`abandon` on a merged task are rejected.
 
 **In flight:** nothing.
 
 **Next:**
-1. Gate-failure recovery: a rejected review (or any gate failing after retries) stops at `RequestHumanReview` with no command path to revise or abandon. Needs a revision phase that re-invokes the executor with the failure reasons.
-2. `knowledge.rs`: write `lessons/<task>.md` after a task and feed the most recent lessons into the next prompt (the rest of week 5–6).
-3. Run one task against a real OpenAI-compatible endpoint and land the first model-authored project.
-4. Sandbox hardening; an execution replay path to rebuild a gitignored `project/` from the log.
+1. `knowledge.rs`: write `lessons/<task>.md` after a task and feed the most recent lessons into the next prompt (the rest of week 5–6).
+2. Run one task against a real OpenAI-compatible endpoint and land the first model-authored project.
+3. Sandbox hardening; an execution replay path to rebuild a gitignored `project/` from the log.
 
 **Blockers:** none.
 

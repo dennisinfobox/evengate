@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::event::{AgentRole, GateId, GateResult};
@@ -7,6 +9,10 @@ use crate::state::{self, ArtifactRef, HumanDecision, Phase, State};
 
 /// Retries allowed per deterministic gate before the machine asks for a human.
 pub const MAX_GATE_ATTEMPTS: u32 = 2;
+
+/// Human-requested revisions allowed per task. Each revision re-invokes the
+/// executor with the gate failures and resets the per-gate attempt counters.
+pub const MAX_REVISIONS: u32 = 2;
 
 /// Prompt payload handed to the stub agent. Recorded indirectly through
 /// `AgentInvoked::prompt_hash`, so it must serialize deterministically.
@@ -20,6 +26,8 @@ pub struct Context {
     pub non_goals: Vec<String>,
     pub context: Vec<String>,
     pub open_questions: Vec<String>,
+    /// Gate failures and human guidance that the next revision must address.
+    pub feedback: Vec<String>,
 }
 
 impl Context {
@@ -33,8 +41,41 @@ impl Context {
             non_goals: spec.non_goals.clone(),
             context: spec.context.clone(),
             open_questions: spec.open_questions.clone(),
+            feedback: Vec::new(),
         }
     }
+
+    pub fn from_revision(
+        spec: &Spec,
+        failures: &BTreeMap<GateId, GateResult>,
+        guidance: Option<&str>,
+    ) -> Self {
+        let mut context = Context::from_spec(spec);
+        context.feedback = revision_feedback(failures, guidance);
+        context
+    }
+}
+
+fn revision_feedback(
+    failures: &BTreeMap<GateId, GateResult>,
+    guidance: Option<&str>,
+) -> Vec<String> {
+    let mut lines: Vec<String> = failures
+        .iter()
+        .filter_map(|(gate, result)| match result {
+            GateResult::Fail { reason } => {
+                Some(format!("{} failed: {reason}", gate::label(*gate)))
+            }
+            GateResult::NeedsHuman { question } => {
+                Some(format!("{} needs attention: {question}", gate::label(*gate)))
+            }
+            GateResult::Pass => None,
+        })
+        .collect();
+    if let Some(text) = guidance.map(str::trim).filter(|text| !text.is_empty()) {
+        lines.push(format!("human guidance: {text}"));
+    }
+    lines
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,6 +126,22 @@ pub fn next_command(state: &State) -> Option<Command> {
             }
         }
         Phase::Generating => Some(Command::AwaitHuman),
+        Phase::Revising => {
+            if state.revisions > MAX_REVISIONS {
+                // Backstop: the CLI refuses more revisions, but a log with an
+                // extra request must not loop the executor forever.
+                Some(review_command())
+            } else {
+                Some(Command::InvokeAgent {
+                    role: AgentRole::Executor,
+                    context: Context::from_revision(
+                        &state.spec,
+                        &state.revision_failures,
+                        state.revision_guidance.as_deref(),
+                    ),
+                })
+            }
+        }
         Phase::Verifying => {
             for gate_id in gate::MANDATORY_V0 {
                 match state.gate_results.get(&gate_id) {
@@ -329,6 +386,107 @@ mod tests {
         let state = reduce(state, &Event::PrOpened { url: "u".into() });
         let state = reduce(state, &Event::HumanApproved { reviewer: "d".into() });
         let state = reduce(state, &Event::Merged { commit: "abc".into() });
+        assert_eq!(next_command(&state), None);
+    }
+
+    fn blocked() -> State {
+        let state = reduce(
+            generated(),
+            &Event::GateEvaluated {
+                gate: GateId::Compiles,
+                result: GateResult::Fail {
+                    reason: "boom".into(),
+                },
+            },
+        );
+        reduce(
+            state,
+            &Event::GateEvaluated {
+                gate: GateId::TestsPass,
+                result: GateResult::Pass,
+            },
+        )
+    }
+
+    #[test]
+    fn revision_reinvokes_the_executor_with_the_failures() {
+        let state = reduce(
+            blocked(),
+            &Event::RevisionRequested {
+                reviewer: "d".into(),
+                guidance: Some("keep it small".into()),
+            },
+        );
+        let Some(Command::InvokeAgent { role, context }) = next_command(&state) else {
+            panic!("expected the executor to be invoked");
+        };
+        assert_eq!(role, AgentRole::Executor);
+        assert_eq!(
+            context.feedback,
+            vec![
+                "cargo check failed: boom".to_string(),
+                "human guidance: keep it small".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn revision_invocation_returns_to_verification() {
+        let state = reduce(
+            blocked(),
+            &Event::RevisionRequested {
+                reviewer: "d".into(),
+                guidance: None,
+            },
+        );
+        let state = reduce(
+            state,
+            &Event::AgentInvoked {
+                role: AgentRole::Executor,
+                prompt_hash: "1".into(),
+            },
+        );
+        let state = reduce(
+            state,
+            &Event::AgentResponded {
+                role: AgentRole::Executor,
+                response: "r".into(),
+                tokens: Default::default(),
+            },
+        );
+        assert_eq!(
+            next_command(&state),
+            Some(Command::RunGate {
+                gate: GateId::Compiles
+            })
+        );
+    }
+
+    #[test]
+    fn revisions_are_bounded() {
+        let mut state = reduce(
+            blocked(),
+            &Event::RevisionRequested {
+                reviewer: "d".into(),
+                guidance: None,
+            },
+        );
+        state.revisions = MAX_REVISIONS + 1;
+        assert!(matches!(
+            next_command(&state),
+            Some(Command::RequestHumanReview { .. })
+        ));
+    }
+
+    #[test]
+    fn abandoned_is_terminal() {
+        let state = reduce(
+            blocked(),
+            &Event::HumanAbandoned {
+                reviewer: "d".into(),
+                reason: "not worth it".into(),
+            },
+        );
         assert_eq!(next_command(&state), None);
     }
 }

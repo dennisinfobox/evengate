@@ -14,6 +14,7 @@ pub enum Phase {
     Drafting,
     Generating,
     Verifying,
+    Revising,
     Reviewing,
     Merged,
     Abandoned,
@@ -42,6 +43,12 @@ pub struct State {
     pub artifacts: Vec<ArtifactRef>,
     pub gate_results: BTreeMap<GateId, GateResult>,
     pub gate_attempts: BTreeMap<GateId, u32>,
+    /// Number of human-requested revisions so far.
+    pub revisions: u32,
+    /// Gate verdicts the last revision request was based on.
+    pub revision_failures: BTreeMap<GateId, GateResult>,
+    /// Optional human guidance attached to the last revision request.
+    pub revision_guidance: Option<String>,
     pub token_spend: TokenUsage,
     pub human_decision: Option<HumanDecision>,
     pub agent_invocations: u32,
@@ -64,6 +71,9 @@ impl Default for State {
             artifacts: Vec::new(),
             gate_results: BTreeMap::new(),
             gate_attempts: BTreeMap::new(),
+            revisions: 0,
+            revision_failures: BTreeMap::new(),
+            revision_guidance: None,
             token_spend: TokenUsage::default(),
             human_decision: None,
             agent_invocations: 0,
@@ -106,6 +116,7 @@ pub fn reduce(mut state: State, event: &Event) -> State {
             state.agent_invocations = state.agent_invocations.saturating_add(1);
             match (state.phase, *role) {
                 (Phase::Drafting, AgentRole::Executor) => state.phase = Phase::Generating,
+                (Phase::Revising, AgentRole::Executor) => state.phase = Phase::Generating,
                 (Phase::Verifying, AgentRole::Reviewer) => {}
                 _ => anomaly(&mut state, "agent_invoked outside its phase"),
             }
@@ -161,6 +172,36 @@ pub fn reduce(mut state: State, event: &Event) -> State {
                 reason: reason.clone(),
             });
         }
+        Event::RevisionRequested {
+            guidance,
+            reviewer: _,
+        } => {
+            if state.phase != Phase::Verifying {
+                anomaly(&mut state, "revision_requested outside verifying");
+            } else {
+                let failures = failures(&state.gate_results);
+                if failures.is_empty() {
+                    anomaly(&mut state, "revision_requested without a failing gate");
+                } else {
+                    state.revisions = state.revisions.saturating_add(1);
+                    state.revision_failures = failures;
+                    state.revision_guidance = guidance
+                        .clone()
+                        .filter(|text| !text.trim().is_empty());
+                    state.gate_results.clear();
+                    state.gate_attempts.clear();
+                    state.phase = Phase::Revising;
+                }
+            }
+        }
+        Event::HumanAbandoned { reason, .. } => {
+            if matches!(state.phase, Phase::Merged | Phase::Abandoned) {
+                anomaly(&mut state, "human_abandoned after a terminal phase");
+            } else {
+                state.phase = Phase::Abandoned;
+                state.abandoned_reason = Some(reason.clone());
+            }
+        }
         Event::PrOpened { url } => {
             if state.phase != Phase::Verifying {
                 anomaly(&mut state, "pr_opened outside verifying");
@@ -187,6 +228,14 @@ pub fn reduce(mut state: State, event: &Event) -> State {
         }
     }
     state
+}
+
+fn failures(results: &BTreeMap<GateId, GateResult>) -> BTreeMap<GateId, GateResult> {
+    results
+        .iter()
+        .filter(|(_, result)| !matches!(result, GateResult::Pass))
+        .map(|(gate, result)| (*gate, result.clone()))
+        .collect()
 }
 
 fn anomaly(state: &mut State, message: &str) {
@@ -335,5 +384,130 @@ mod tests {
         );
         assert_eq!(state.anomalies.len(), 1);
         assert!(state.anomalies[0].contains("outside its phase"));
+    }
+
+    fn blocked() -> State {
+        let state = reduce(
+            created(),
+            &Event::AgentInvoked {
+                role: AgentRole::Executor,
+                prompt_hash: "0".into(),
+            },
+        );
+        let state = reduce(
+            state,
+            &Event::AgentResponded {
+                role: AgentRole::Executor,
+                response: "r".into(),
+                tokens: TokenUsage::default(),
+            },
+        );
+        let state = reduce(
+            state,
+            &Event::GateEvaluated {
+                gate: GateId::Compiles,
+                result: GateResult::Fail {
+                    reason: "boom".into(),
+                },
+            },
+        );
+        reduce(
+            state,
+            &Event::GateEvaluated {
+                gate: GateId::TestsPass,
+                result: GateResult::Pass,
+            },
+        )
+    }
+
+    #[test]
+    fn revision_clears_gates_and_enters_revising() {
+        let state = reduce(
+            blocked(),
+            &Event::RevisionRequested {
+                reviewer: "d".into(),
+                guidance: Some("fix the type error".into()),
+            },
+        );
+        assert_eq!(state.phase, Phase::Revising);
+        assert_eq!(state.revisions, 1);
+        assert!(state.gate_results.is_empty());
+        assert!(state.gate_attempts.is_empty());
+        assert!(matches!(
+            state.revision_failures.get(&GateId::Compiles),
+            Some(GateResult::Fail { .. })
+        ));
+        assert_eq!(
+            state.revision_guidance.as_deref(),
+            Some("fix the type error")
+        );
+        assert!(state.anomalies.is_empty(), "{:?}", state.anomalies);
+    }
+
+    #[test]
+    fn revision_without_a_failure_is_an_anomaly() {
+        let mut state = created();
+        state.phase = Phase::Verifying;
+        state = passed(state);
+        state = reduce(
+            state,
+            &Event::RevisionRequested {
+                reviewer: "d".into(),
+                guidance: None,
+            },
+        );
+        assert_eq!(state.phase, Phase::Verifying);
+        assert_eq!(state.revisions, 0);
+        assert_eq!(state.anomalies.len(), 1);
+    }
+
+    #[test]
+    fn revision_runs_the_executor_again() {
+        let state = reduce(
+            blocked(),
+            &Event::RevisionRequested {
+                reviewer: "d".into(),
+                guidance: None,
+            },
+        );
+        let state = reduce(
+            state,
+            &Event::AgentInvoked {
+                role: AgentRole::Executor,
+                prompt_hash: "1".into(),
+            },
+        );
+        assert_eq!(state.phase, Phase::Generating);
+        let state = reduce(
+            state,
+            &Event::AgentResponded {
+                role: AgentRole::Executor,
+                response: "r2".into(),
+                tokens: TokenUsage::default(),
+            },
+        );
+        assert_eq!(state.phase, Phase::Verifying);
+        assert!(state.anomalies.is_empty(), "{:?}", state.anomalies);
+    }
+
+    #[test]
+    fn human_abandonment_is_terminal() {
+        let state = reduce(
+            created(),
+            &Event::HumanAbandoned {
+                reviewer: "d".into(),
+                reason: "not worth it".into(),
+            },
+        );
+        assert_eq!(state.phase, Phase::Abandoned);
+        assert_eq!(state.abandoned_reason.as_deref(), Some("not worth it"));
+        let state = reduce(
+            state,
+            &Event::HumanAbandoned {
+                reviewer: "d".into(),
+                reason: "again".into(),
+            },
+        );
+        assert_eq!(state.anomalies.len(), 1);
     }
 }

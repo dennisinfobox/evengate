@@ -12,7 +12,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::event::Event;
+use crate::event::{Event, GateResult};
 use crate::executor::ExecCtx;
 use crate::machine::Command;
 use crate::state::{Phase, State};
@@ -25,6 +25,9 @@ Usage:
   ev replay <task-dir>                      rebuild state.json from events.jsonl
   ev approve <task-dir> --reviewer <name>   record human approval, then finalize
   ev reject <task-dir> --reviewer <name> --reason <text>
+  ev revise <task-dir> --reviewer <name> [--reason <text>]
+                                            re-run the executor with the gate failures
+  ev abandon <task-dir> --reviewer <name> --reason <text>
   ev help
 ";
 
@@ -42,6 +45,8 @@ fn dispatch(args: &[String]) -> Result<(), String> {
         Some("replay") => replay(args),
         Some("approve") => decide(args, true),
         Some("reject") => decide(args, false),
+        Some("revise") => revise(args),
+        Some("abandon") => abandon(args),
         Some("help" | "--help" | "-h") | None => {
             print!("{USAGE}");
             Ok(())
@@ -78,7 +83,10 @@ fn resume(task_dir: &Path, mut state: State) -> Result<(), String> {
     while let Some(command) = machine::next_command(&state) {
         if command.is_awaiting() {
             match &command {
-                Command::RequestHumanReview { .. } => println!("ev: gate blocked; human review required"),
+                Command::RequestHumanReview { .. } => {
+                    println!("ev: gate blocked; human review required");
+                    print_blockers(&state);
+                }
                 _ => println!("ev: waiting for a human decision"),
             }
             break;
@@ -167,6 +175,95 @@ fn decide(args: &[String], approve: bool) -> Result<(), String> {
     log::write_state(&task_dir, &state).map_err(|e| format!("cannot write state: {e}"))?;
     events.push(event);
     resume(&task_dir, fold(&events))
+}
+
+fn revise(args: &[String]) -> Result<(), String> {
+    let usage = "usage: ev revise <task-dir> --reviewer <name> [--reason <text>]";
+    let task_dir = PathBuf::from(args.get(1).ok_or(usage)?);
+    let reviewer = flag(args, "--reviewer").ok_or(usage)?.to_string();
+    let guidance = flag(args, "--reason").map(str::to_string);
+    let mut events = log::read_events(&task_dir)
+        .map_err(|e| format!("cannot read {}: {e}", log::events_path(&task_dir).display()))?;
+    if events.is_empty() {
+        return Err(format!("no events in {}", task_dir.display()));
+    }
+    let state = fold(&events);
+    let blocked = state.phase == Phase::Verifying
+        && matches!(
+            machine::next_command(&state),
+            Some(Command::RequestHumanReview { .. })
+        );
+    if !blocked {
+        return Err(format!(
+            "task is in phase {} and is not blocked by a gate",
+            phase_name(state.phase)
+        ));
+    }
+    if state.revisions >= machine::MAX_REVISIONS {
+        return Err(format!(
+            "revision limit reached ({}); abandon the task or accept the result",
+            machine::MAX_REVISIONS
+        ));
+    }
+    let event = Event::RevisionRequested {
+        reviewer,
+        guidance,
+    };
+    log::append_event(&task_dir, &event).map_err(|e| format!("cannot append event: {e}"))?;
+    events.push(event);
+    let state = fold(&events);
+    log::write_state(&task_dir, &state).map_err(|e| format!("cannot write state: {e}"))?;
+    println!(
+        "ev: revision {} of {} requested",
+        state.revisions,
+        machine::MAX_REVISIONS
+    );
+    resume(&task_dir, state)
+}
+
+fn abandon(args: &[String]) -> Result<(), String> {
+    let usage = "usage: ev abandon <task-dir> --reviewer <name> --reason <text>";
+    let task_dir = PathBuf::from(args.get(1).ok_or(usage)?);
+    let reviewer = flag(args, "--reviewer").ok_or(usage)?.to_string();
+    let reason = flag(args, "--reason").ok_or(usage)?.to_string();
+    let mut events = log::read_events(&task_dir)
+        .map_err(|e| format!("cannot read {}: {e}", log::events_path(&task_dir).display()))?;
+    if events.is_empty() {
+        return Err(format!("no events in {}", task_dir.display()));
+    }
+    let state = fold(&events);
+    if matches!(state.phase, Phase::Merged | Phase::Abandoned) {
+        return Err(format!("task is already {}", phase_name(state.phase)));
+    }
+    let event = Event::HumanAbandoned { reviewer, reason };
+    log::append_event(&task_dir, &event).map_err(|e| format!("cannot append event: {e}"))?;
+    events.push(event);
+    let state = fold(&events);
+    log::write_state(&task_dir, &state).map_err(|e| format!("cannot write state: {e}"))?;
+    resume(&task_dir, state)
+}
+
+fn print_blockers(state: &State) {
+    let results = if state.phase == Phase::Revising {
+        &state.revision_failures
+    } else {
+        &state.gate_results
+    };
+    for (id, result) in results {
+        match result {
+            GateResult::Fail { reason } => println!("ev:   {}: {reason}", gate::label(*id)),
+            GateResult::NeedsHuman { question } => {
+                println!("ev:   {}: {question}", gate::label(*id))
+            }
+            GateResult::Pass => {}
+        }
+    }
+    if state.revisions >= machine::MAX_REVISIONS {
+        println!(
+            "ev:   revision limit reached ({}); use `ev abandon` to stop",
+            machine::MAX_REVISIONS
+        );
+    }
 }
 
 fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {

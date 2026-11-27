@@ -25,6 +25,14 @@ pub enum Event {
     GateEvaluated { gate: GateId, result: GateResult },
     HumanApproved { reviewer: String },
     HumanRejected { reviewer: String, reason: String },
+    /// A human asks the executor to fix a gate-blocked artifact. Valid only
+    /// during `Verifying` with at least one non-passing gate verdict.
+    RevisionRequested {
+        reviewer: String,
+        guidance: Option<String>,
+    },
+    /// A human ends a task that a gate blocked, instead of rejecting a PR.
+    HumanAbandoned { reviewer: String, reason: String },
     PrOpened { url: String },
     Merged { commit: String },
     TaskAbandoned { reason: String },
@@ -41,8 +49,7 @@ pub enum AgentRole {
     #[allow(dead_code)]
     Planner,
     Executor,
-    /// Reserved by the v0 vocabulary; the review agent arrives in week 5–6.
-    #[allow(dead_code)]
+    /// Reviews the project tree before human approval.
     Reviewer,
 }
 
@@ -62,8 +69,7 @@ pub enum GateId {
     Compiles,
     TestsPass,
     LintsClean,
-    /// Reserved by the v0 vocabulary; recorded as `NeedsHuman` only.
-    #[allow(dead_code)]
+    /// LLM-backed review of the project tree; the last mandatory v0 gate.
     ReviewAgent,
     /// Reserved; human approval is an event, not a deterministic gate.
     #[allow(dead_code)]
