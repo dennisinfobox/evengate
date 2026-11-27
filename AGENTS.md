@@ -44,6 +44,8 @@ Evengate is a personal software factory: a deterministic Rust control plane that
    - `cargo clippy --locked -- -D warnings`
 5. Rewrite `docs/STATUS.md` and append an ADR if a decision was made.
 6. Commit with a one-line subject and a short body.
+7. Push each logically completed slice to `origin` before starting the next one. Do not batch unrelated slices into a single push.
+8. Before every push, scan the commit and any newly tracked files for sensitive data: API keys, tokens, private keys, passwords, `.env` or credential files, authenticated URLs, and absolute home paths that reveal the owner's machine. If anything is found, stop and ask the owner for explicit confirmation; never push it silently.
 
 ## Definition of done
 
@@ -51,6 +53,7 @@ Evengate is a personal software factory: a deterministic Rust control plane that
 - The checks in step 4 pass.
 - `docs/STATUS.md` reflects the new reality.
 - Decisions made along the way are in `docs/DECISIONS.md`.
+- The slice is committed, scanned for sensitive data, and pushed.
 - No unreferenced dead files, no duplicate specs, no chat transcripts committed.
 
 ## Writing `STATUS.md`
