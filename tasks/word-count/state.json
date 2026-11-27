@@ -1,5 +1,5 @@
 {
-  "phase": "verifying",
+  "phase": "abandoned",
   "task_created": true,
   "spec": {
     "title": "Word Count CLI",
@@ -58,7 +58,7 @@
   "agent_responses": 3,
   "pr_url": null,
   "merged_commit": null,
-  "abandoned_reason": null,
+  "abandoned_reason": "revision cap reached: the test used io::ErrorKind without importing std::io",
   "last_tick": null,
   "anomalies": []
 }
