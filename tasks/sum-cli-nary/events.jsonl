@@ -34,3 +34,6 @@
 {"type":"command_executed","cmd":"git push -q C:\\Users\\Dennis\\source\\repos\\evengate\\tasks\\sum-cli-nary\\artifacts\\remote.git main","exit_code":0,"stdout":"","stderr":""}
 {"type":"command_executed","cmd":"git push -q C:\\Users\\Dennis\\source\\repos\\evengate\\tasks\\sum-cli-nary\\artifacts\\remote.git ev/sum-cli","exit_code":0,"stdout":"","stderr":""}
 {"type":"pr_opened","url":"file:///C:/Users/Dennis/source/repos/evengate/tasks/sum-cli-nary/artifacts/remote.git#ev/sum-cli"}
+{"type":"human_approved","reviewer":"dennis"}
+{"type":"command_executed","cmd":"git rev-parse HEAD","exit_code":0,"stdout":"06870674b80b7f6cdaece7b6104fd9b00d8c74a2\n","stderr":""}
+{"type":"merged","commit":"06870674b80b7f6cdaece7b6104fd9b00d8c74a2"}

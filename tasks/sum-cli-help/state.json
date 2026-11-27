@@ -1,5 +1,5 @@
 {
-  "phase": "reviewing",
+  "phase": "merged",
   "task_created": true,
   "spec": {
     "title": "Sum CLI",
@@ -68,11 +68,14 @@
     "input": 5847,
     "output": 3047
   },
-  "human_decision": null,
+  "human_decision": {
+    "decision": "approved",
+    "reviewer": "dennis"
+  },
   "agent_invocations": 4,
   "agent_responses": 4,
   "pr_url": "file:///C:/Users/Dennis/source/repos/evengate/tasks/sum-cli-help/artifacts/remote.git#ev/sum-cli",
-  "merged_commit": null,
+  "merged_commit": "0a25c9a5e7d42cd7cf6edc5fdcc5cbd27ae7f2aa",
   "abandoned_reason": null,
   "last_tick": null,
   "anomalies": [],

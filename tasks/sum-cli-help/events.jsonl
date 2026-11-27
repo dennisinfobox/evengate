@@ -42,3 +42,6 @@
 {"type":"command_executed","cmd":"git push -q C:\\Users\\Dennis\\source\\repos\\evengate\\tasks\\sum-cli-help\\artifacts\\remote.git main","exit_code":0,"stdout":"","stderr":""}
 {"type":"command_executed","cmd":"git push -q C:\\Users\\Dennis\\source\\repos\\evengate\\tasks\\sum-cli-help\\artifacts\\remote.git ev/sum-cli","exit_code":0,"stdout":"","stderr":""}
 {"type":"pr_opened","url":"file:///C:/Users/Dennis/source/repos/evengate/tasks/sum-cli-help/artifacts/remote.git#ev/sum-cli"}
+{"type":"human_approved","reviewer":"dennis"}
+{"type":"command_executed","cmd":"git rev-parse HEAD","exit_code":0,"stdout":"0a25c9a5e7d42cd7cf6edc5fdcc5cbd27ae7f2aa\n","stderr":""}
+{"type":"merged","commit":"0a25c9a5e7d42cd7cf6edc5fdcc5cbd27ae7f2aa"}
