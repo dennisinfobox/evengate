@@ -33,6 +33,16 @@ pub enum Event {
     },
     /// A human ends a task that a gate blocked, instead of rejecting a PR.
     HumanAbandoned { reviewer: String, reason: String },
+    /// Cross-task lesson counts recorded by the executor after a review.
+    LessonRepeated {
+        lesson: String,
+        text: String,
+        count: u32,
+    },
+    /// A human promoted a repeated lesson into `rules/<project>.md`.
+    LessonPromoted { reviewer: String, lesson: String },
+    /// A human declined promotion for this task.
+    LessonDismissed { reviewer: String, lesson: String },
     PrOpened { url: String },
     Merged { commit: String },
     TaskAbandoned { reason: String },

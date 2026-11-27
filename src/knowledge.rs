@@ -1,9 +1,13 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Lessons fed into a prompt. Spec §7.8 says the five most recent.
 pub const RECENT_LESSONS: usize = 5;
+
+/// A lesson seen in this many tasks is proposed for promotion to `rules/`.
+pub const PROMOTION_THRESHOLD: u32 = 3;
 
 /// A lessons file read back from disk. `name` is the file stem (the task id).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,6 +107,119 @@ pub fn rules_section(rules: Option<&str>) -> String {
             "\n# Project rules\nThese rules apply to every task in this project. Follow them together with the task spec; the more specific instruction wins.\n\n{rules}\n"
         ),
     }
+}
+
+/// A lesson counted across lesson files, with one representative spelling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LessonCount {
+    pub text: String,
+    pub count: u32,
+}
+
+/// Stable identity for "the same lesson": bullet markers and whitespace are
+/// irrelevant, and ASCII case is ignored. Punctuation is preserved.
+pub fn canonical_lesson(text: &str) -> String {
+    let text = text.trim();
+    let text = text
+        .strip_prefix("- ")
+        .or_else(|| text.strip_prefix("* "))
+        .unwrap_or(text);
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+/// Count each lesson once per task file, across every `*.md` in the lessons
+/// directory. A missing directory is an empty knowledge base.
+pub fn count_lessons(dir: &Path) -> Result<BTreeMap<String, LessonCount>, String> {
+    let mut counts: BTreeMap<String, LessonCount> = BTreeMap::new();
+    if !dir.is_dir() {
+        return Ok(counts);
+    }
+    let mut paths: Vec<PathBuf> = Vec::new();
+    let entries = fs::read_dir(dir)
+        .map_err(|e| format!("cannot read lessons directory {}: {e}", dir.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
+        let path = entry.path();
+        if path.is_file() && path.extension().and_then(|ext| ext.to_str()) == Some("md") {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+
+    for path in paths {
+        let body = fs::read_to_string(&path)
+            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        let mut seen = BTreeSet::new();
+        for line in body.lines() {
+            let trimmed = line.trim();
+            let bullet = trimmed
+                .strip_prefix("- ")
+                .or_else(|| trimmed.strip_prefix("* "));
+            let Some(bullet) = bullet else { continue };
+            let key = canonical_lesson(bullet);
+            if key.is_empty() || !seen.insert(key.clone()) {
+                continue;
+            }
+            let entry = counts.entry(key).or_insert_with(|| LessonCount {
+                text: bullet.split_whitespace().collect::<Vec<_>>().join(" "),
+                count: 0,
+            });
+            entry.count = entry.count.saturating_add(1);
+        }
+    }
+    Ok(counts)
+}
+
+/// Canonical lessons already present as bullets in a rules file.
+pub fn rule_lessons(rules: Option<&str>) -> BTreeSet<String> {
+    let mut lessons = BTreeSet::new();
+    if let Some(text) = rules {
+        for line in text.lines() {
+            let trimmed = line.trim();
+            let bullet = trimmed
+                .strip_prefix("- ")
+                .or_else(|| trimmed.strip_prefix("* "));
+            if let Some(bullet) = bullet {
+                let key = canonical_lesson(bullet);
+                if !key.is_empty() {
+                    lessons.insert(key);
+                }
+            }
+        }
+    }
+    lessons
+}
+
+/// Append a promoted lesson to `rules/<project>.md`, creating the file when
+/// needed. An already present lesson is left untouched.
+pub fn append_rule(dir: &Path, project: &str, lesson: &str) -> Result<PathBuf, String> {
+    let lesson = lesson.split_whitespace().collect::<Vec<_>>().join(" ");
+    if lesson.is_empty() {
+        return Err("cannot promote an empty lesson".into());
+    }
+    let path = dir.join(format!("{}.md", file_stem(project)));
+    let existing = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(format!("cannot read {}: {error}", path.display())),
+    };
+    if rule_lessons(Some(existing.as_str())).contains(&canonical_lesson(&lesson)) {
+        return Ok(path);
+    }
+    fs::create_dir_all(dir)
+        .map_err(|e| format!("cannot create rules directory {}: {e}", dir.display()))?;
+    let mut body = existing;
+    if body.is_empty() {
+        body.push_str(&format!("# Rules — {project}\n\n"));
+    } else if !body.ends_with('\n') {
+        body.push('\n');
+    }
+    body.push_str(&format!("- {lesson}\n"));
+    fs::write(&path, body).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    Ok(path)
 }
 
 /// Prompt section for the executor. Empty when there is no knowledge yet.
@@ -236,6 +353,52 @@ mod tests {
 
         fs::write(dir.join("hello.md"), [0xff, 0xfe]).unwrap();
         assert!(read_rules(&dir, "hello").is_err());
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn counts_lessons_once_per_task_and_canonicalizes() {
+        let dir = temp_dir("count");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("a.md"),
+            "# Lessons — A\n\n- Keep it  small.\n- keep IT small.\n",
+        )
+        .unwrap();
+        fs::write(dir.join("b.md"), "## B\n* Keep it small.\n").unwrap();
+
+        let key = canonical_lesson("Keep it small.");
+        assert_eq!(key, "keep it small.");
+        let counts = count_lessons(&dir).unwrap();
+        assert_eq!(counts[&key].count, 2);
+        assert_eq!(counts[&key].text, "Keep it small.");
+
+        fs::write(dir.join("c.md"), "- KEEP IT SMALL.\n").unwrap();
+        assert_eq!(count_lessons(&dir).unwrap()[&key].count, 3);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn append_rule_creates_appends_and_dedupes() {
+        let dir = temp_dir("append-rule");
+        let path = append_rule(&dir, "hello", "Keep it small.").unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "# Rules — hello\n\n- Keep it small.\n"
+        );
+
+        append_rule(&dir, "hello", "keep it  SMALL.").unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "# Rules — hello\n\n- Keep it small.\n"
+        );
+
+        append_rule(&dir, "hello", "No unsafe code.").unwrap();
+        let body = fs::read_to_string(&path).unwrap();
+        assert_eq!(body.matches("Keep it small.").count(), 1);
+        assert!(body.ends_with("- No unsafe code.\n"));
 
         fs::remove_dir_all(&dir).unwrap();
     }

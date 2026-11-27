@@ -1,6 +1,8 @@
-# Evengate — Technical Specification v0.11
+# Evengate — Technical Specification v0.12
 
 > A deterministic, Rust-native software factory that builds and improves itself under human oversight, and later produces pet projects in a familiar way.
+
+**Changes from v0.11:** a lesson seen in three tasks now pauses the task before its PR; `ev promote` adds it to `rules/`, `ev dismiss` declines for that task (§7.8, ADR-0014).
 
 **Changes from v0.10:** project-wide `rules/<project>.md` now joins every executor and reviewer prompt, read from the rules root (`rules/` by default, `EVENGATE_RULES_DIR` overrides) at prompt-assembly time (§7.8, ADR-0013).
 
@@ -204,6 +206,9 @@ pub enum Event {
     HumanRejected { reviewer: String, reason: String },
     RevisionRequested { reviewer: String, guidance: Option<String> },
     HumanAbandoned { reviewer: String, reason: String },
+    LessonRepeated { lesson: String, text: String, count: u32 },
+    LessonPromoted { reviewer: String, lesson: String },
+    LessonDismissed { reviewer: String, lesson: String },
     PrOpened { url: String },
     Merged { commit: String },
     TaskAbandoned { reason: String },
@@ -369,7 +374,14 @@ Knowledge is **structured, versioned, and fed back into prompts**. Not a vector 
 
 The prompt states that the current spec and constraints win over inherited lessons. Rules and lessons are read during prompt assembly, never cached in `State`, so a human edit applies to the next invocation. The same `# Project rules` section is given to the review agent, so a project rule is checked as well as prompted. The raw reviewer response recorded in `AgentResponded` is the event-log source for a lesson file, so `ev replay` remains a pure fold and `ev materialize` can rebuild the file. `codebase-map.md` joins the prompt once a planner consumes it; the lessons path is the v0 feedback loop.
 
-**Promotion path:** if the same lesson appears ≥ 3 times across tasks, `machine.rs` emits a `Command::RequestHumanReview` proposing to promote it to `rules/`. Promotion is always a human decision.
+**Promotion path:** after a review writes a lesson file, the executor counts each lesson once per task file across `lessons/*.md`. Bullet markers and whitespace are ignored and ASCII case is folded, so "Keep it small." and "- keep it  small." are the same lesson. The executor records a `LessonRepeated { lesson, text, count }` event for every lesson seen at least three times that is not already a bullet in `rules/<project>.md`.
+
+Once every mandatory gate passes, `machine.rs` pauses before `OpenPullRequest` and emits `Command::RequestHumanReview` with artifact kind `promotion` and the proposal in `detail`. The human decides:
+
+- `ev promote <task-dir> --reviewer <name> [--lesson <text>]` appends the lesson to `rules/<project>.md` and records `LessonPromoted`;
+- `ev dismiss <task-dir> --reviewer <name> [--lesson <text>]` records `LessonDismissed` and changes no file.
+
+One lesson is decided per invocation, in canonical key order; the task then asks for the next decision or continues to the PR. Dismissal is recorded in that task's log only: because per-task logs are independent (ADR-0005), the next task proposes the lesson again unless it is promoted. Promotion is always a human decision.
 
 This is Evengate's real moat. A vector index can be added later without changing the artifact schema.
 

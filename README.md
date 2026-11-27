@@ -32,6 +32,10 @@ cargo run --locked --bin ev -- replay tasks/hello
 # when a gate blocks the task:
 cargo run --locked --bin ev -- revise tasks/hello --reviewer <your-name> --reason "fix the failing test"
 cargo run --locked --bin ev -- abandon tasks/hello --reviewer <your-name> --reason "not worth finishing"
+
+# when a repeated lesson is proposed:
+cargo run --locked --bin ev -- promote tasks/hello --reviewer <your-name>
+cargo run --locked --bin ev -- dismiss tasks/hello --reviewer <your-name>
 ```
 
 Binaries: `ev` (daily use) and `evengate` (scripts, CI), both built from `src/main.rs`.
@@ -49,6 +53,8 @@ When a gate blocks a task, `ev revise` re-runs the executor with the failing ver
 The review agent also returns 3–5 lessons. The executor writes them to `lessons/<task-id>.md`, and the next executor prompt includes the five most recent lesson files; the current spec always wins over inherited advice.
 
 Project-wide rules live in `rules/<project>.md`, where `<project>` is the spec title slug. They join both the executor and the reviewer prompt on every invocation; a missing or blank file adds nothing, and an unreadable file fails the run.
+
+After each review the executor counts canonical lessons across `lessons/*.md`. A lesson seen in three tasks pauses the task before its PR: `ev promote` appends it to `rules/<project>.md` and continues; `ev dismiss` declines for that task. Dismissal is task-scoped, so a later task may propose the same unpromoted lesson again.
 
 `project/` and `lessons/` are derived state. `ev materialize <task-dir>` rebuilds both from `events.jsonl` without a model or network: the last executor manifest becomes `project/`, and the last usable reviewer verdict becomes the lesson file. `state.json` is untouched. Only recorded files are recreated, so a local `.git` or `target/` inside `project/` is dropped; the bare remote under `artifacts/` is not.
 

@@ -5,17 +5,17 @@ Last updated: 2026-11-28
 **Phase:** 1 — First tasks (week 5–6). The first model-authored project is merged.
 
 **Done since last handoff:**
-- Abandoned `tasks/word-count` at the two-revision cap with a `HumanAbandoned` event; its 28 events replay byte-identically.
-- Hardened gate containers: read-only root and `project/` mount, 1 GiB executable `/tmp` tmpfs, 2 GiB memory/swap cap, PID cap 256, CPU cap 2, capabilities dropped, `no-new-privileges`, `--init`. Overrides: `EVENGATE_SANDBOX_MEMORY`, `EVENGATE_SANDBOX_CPUS`, `EVENGATE_SANDBOX_PIDS`. Spec v0.10, ADR-0012.
-- Wired project rules: both executor and reviewer prompts read `rules/<project>.md` (root `rules/`, override `EVENGATE_RULES_DIR`) at assembly time. Missing or blank means no section; unreadable fails the run. Spec v0.11, ADR-0013.
-- Checks pass: `cargo check --locked`, `cargo test --locked` (72 tests), `cargo clippy --locked -- -D warnings`.
+- Promotion path: after a review, the executor counts canonical lessons once per `lessons/*.md` file and records `LessonRepeated` for lessons seen at least three times that are not already in `rules/<project>.md`. Once every gate passes, `machine.rs` pauses before `OpenPullRequest` and asks for a human decision. `ev promote` appends the lesson to the project rules file and records `LessonPromoted`; `ev dismiss` records `LessonDismissed` only. Spec v0.12, ADR-0014.
+- Verified end to end: both commands clear the pause and open the PR, and `promote` creates `rules/hello.md`.
+- `tasks/sum-cli` and `tasks/word-count` replay byte-identically with the new state fields.
+- Checks pass: `cargo check --locked`, `cargo test --locked` (81 tests per binary), `cargo clippy --locked -- -D warnings`.
 
 **In flight:** nothing.
 
 **Next:**
-1. Implement the ≥3-occurrence promotion path from §7.8; it needs a reducer-visible source for lesson repetition, so record the design in an ADR first.
-2. `codebase-map.md` joins prompt assembly once a planner role has a consumer.
-3. Optional: run a fresh word-count task from a sharper spec.
+1. Run a second task to exercise the lessons/rules feedback loop end to end (week 5–6 exit criterion); the promotion threshold needs three tasks with the same lesson before it fires naturally.
+2. Decide what to do with `tasks/hello`: its committed snapshot predates the `ReviewAgent` gate, so `ev replay` reports "merged without passed gates and human approval". Regenerate the snapshot or keep it as historical evidence.
+3. `codebase-map.md` joins prompt assembly once a planner role has a consumer.
 
 **Blockers:** none.
 

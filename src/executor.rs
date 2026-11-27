@@ -463,7 +463,8 @@ fn run_review_gate(ctx: &ExecCtx) -> Result<Vec<Event>, String> {
             lessons: Vec::new(),
         },
     };
-    if !report.lessons.is_empty() {
+    let wrote_lesson = !report.lessons.is_empty();
+    if wrote_lesson {
         knowledge::write_lesson(
             &ctx.lessons_dir,
             &ctx.task_id,
@@ -471,7 +472,7 @@ fn run_review_gate(ctx: &ExecCtx) -> Result<Vec<Event>, String> {
             &report.lessons,
         )?;
     }
-    Ok(vec![
+    let mut events = vec![
         Event::AgentInvoked {
             role: AgentRole::Reviewer,
             prompt_hash: request.prompt_hash(),
@@ -485,7 +486,38 @@ fn run_review_gate(ctx: &ExecCtx) -> Result<Vec<Event>, String> {
             gate: GateId::ReviewAgent,
             result: report.result,
         },
-    ])
+    ];
+    if wrote_lesson {
+        events.extend(repetition_events(
+            &ctx.lessons_dir,
+            &ctx.rules_dir,
+            &ctx.project_name,
+        )?);
+    }
+    Ok(events)
+}
+
+/// Lessons seen in enough tasks to be promoted. Lessons already present in
+/// the project's rules file are not proposed again.
+fn repetition_events(
+    lessons_dir: &Path,
+    rules_dir: &Path,
+    project: &str,
+) -> Result<Vec<Event>, String> {
+    let counts = knowledge::count_lessons(lessons_dir)?;
+    let rules = knowledge::read_rules(rules_dir, project)?;
+    let known = knowledge::rule_lessons(rules.as_deref());
+    Ok(counts
+        .into_iter()
+        .filter(|(lesson, counted)| {
+            counted.count >= knowledge::PROMOTION_THRESHOLD && !known.contains(lesson)
+        })
+        .map(|(lesson, counted)| Event::LessonRepeated {
+            lesson,
+            text: counted.text,
+            count: counted.count,
+        })
+        .collect())
 }
 
 fn open_pull_request(branch: &str, ctx: &ExecCtx) -> Result<Vec<Event>, String> {
@@ -1002,6 +1034,46 @@ mod tests {
         )
         .unwrap();
         assert!(materialize(&task, &root.join("lessons")).is_err());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn repetition_events_fire_at_the_threshold_and_skip_rules() {
+        let root = materialize_dir("repetition");
+        let lessons = root.join("lessons");
+        let rules = root.join("rules");
+        fs::create_dir_all(&lessons).unwrap();
+        for (name, line) in [
+            ("a.md", "Keep it small."),
+            ("b.md", "keep it  small."),
+        ] {
+            fs::write(lessons.join(name), format!("# Lessons\n\n- {line}\n")).unwrap();
+        }
+        assert!(repetition_events(&lessons, &rules, "hello")
+            .unwrap()
+            .is_empty());
+
+        fs::write(lessons.join("c.md"), "# Lessons\n\n- KEEP IT SMALL.\n").unwrap();
+        let events = repetition_events(&lessons, &rules, "hello").unwrap();
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            Event::LessonRepeated {
+                lesson,
+                text,
+                count,
+            } => {
+                assert_eq!(lesson, "keep it small.");
+                assert_eq!(text, "Keep it small.");
+                assert_eq!(*count, 3);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        knowledge::append_rule(&rules, "hello", "Keep it small.").unwrap();
+        assert!(repetition_events(&lessons, &rules, "hello")
+            .unwrap()
+            .is_empty());
+
         fs::remove_dir_all(&root).unwrap();
     }
 }

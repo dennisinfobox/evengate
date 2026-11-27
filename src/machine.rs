@@ -4,8 +4,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::event::{AgentRole, GateId, GateResult};
 use crate::gate;
+use crate::knowledge;
 use crate::spec::{self, Spec};
-use crate::state::{self, ArtifactRef, HumanDecision, Phase, State};
+use crate::state::{self, ArtifactRef, HumanDecision, Phase, RepeatedLesson, State};
 
 /// Retries allowed per deterministic gate before the machine asks for a human.
 pub const MAX_GATE_ATTEMPTS: u32 = 2;
@@ -163,6 +164,9 @@ pub fn next_command(state: &State) -> Option<Command> {
                     None => return Some(Command::RunGate { gate: gate_id }),
                 }
             }
+            if let Some(command) = promotion_command(state) {
+                return Some(command);
+            }
             Some(Command::OpenPullRequest {
                 branch: branch_name(&state.spec),
             })
@@ -187,11 +191,39 @@ pub fn next_command(state: &State) -> Option<Command> {
     }
 }
 
+/// Repeated lessons the human has not promoted or dismissed in this task.
+pub fn pending_promotions(state: &State) -> Vec<(String, RepeatedLesson)> {
+    state
+        .repeated_lessons
+        .iter()
+        .filter(|(lesson, repeated)| {
+            repeated.count >= knowledge::PROMOTION_THRESHOLD
+                && !state.promotion_decisions.contains_key(*lesson)
+        })
+        .map(|(lesson, repeated)| (lesson.clone(), repeated.clone()))
+        .collect()
+}
+
+fn promotion_command(state: &State) -> Option<Command> {
+    let (_, repeated) = pending_promotions(state).into_iter().next()?;
+    Some(Command::RequestHumanReview {
+        artifact: ArtifactRef {
+            path: format!("rules/{}.md", spec::slug(&state.spec.title)),
+            kind: "promotion".into(),
+            detail: Some(format!(
+                "lesson repeated {} times: \"{}\"",
+                repeated.count, repeated.text
+            )),
+        },
+    })
+}
+
 fn review_command() -> Command {
     Command::RequestHumanReview {
         artifact: ArtifactRef {
             path: "project".into(),
             kind: "tree".into(),
+            detail: None,
         },
     }
 }
@@ -200,7 +232,7 @@ fn review_command() -> Command {
 mod tests {
     use super::*;
     use crate::event::{Event, GateId, GateResult};
-    use crate::state::{initial, reduce};
+    use crate::state::{initial, reduce, PromotionDecision};
 
     fn spec() -> Spec {
         Spec {
@@ -476,6 +508,109 @@ mod tests {
             next_command(&state),
             Some(Command::RequestHumanReview { .. })
         ));
+    }
+
+    fn with_repetition(state: State, lesson: &str, count: u32) -> State {
+        reduce(
+            state,
+            &Event::LessonRepeated {
+                lesson: lesson.into(),
+                text: "Keep it small.".into(),
+                count,
+            },
+        )
+    }
+
+    #[test]
+    fn a_repeated_lesson_pauses_before_the_pull_request() {
+        let state = with_repetition(with_passes(generated()), "keep it small.", 3);
+        let Some(Command::RequestHumanReview { artifact }) = next_command(&state) else {
+            panic!("expected a promotion review");
+        };
+        assert_eq!(artifact.kind, "promotion");
+        assert_eq!(artifact.path, "rules/hello.md");
+        let detail = artifact.detail.unwrap();
+        assert!(detail.contains("repeated 3 times"), "{detail}");
+        assert!(detail.contains("Keep it small."), "{detail}");
+    }
+
+    #[test]
+    fn promotion_decisions_unblock_the_pull_request() {
+        let base = with_repetition(with_passes(generated()), "keep it small.", 3);
+        for decision in [PromotionDecision::Promoted, PromotionDecision::Dismissed] {
+            let event = match decision {
+                PromotionDecision::Promoted => Event::LessonPromoted {
+                    reviewer: "dennis".into(),
+                    lesson: "keep it small.".into(),
+                },
+                PromotionDecision::Dismissed => Event::LessonDismissed {
+                    reviewer: "dennis".into(),
+                    lesson: "keep it small.".into(),
+                },
+            };
+            let state = reduce(base.clone(), &event);
+            assert!(matches!(
+                next_command(&state),
+                Some(Command::OpenPullRequest { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn a_lesson_below_the_threshold_does_not_pause() {
+        let state = with_repetition(with_passes(generated()), "keep it small.", 2);
+        assert!(matches!(
+            next_command(&state),
+            Some(Command::OpenPullRequest { .. })
+        ));
+    }
+
+    #[test]
+    fn promotions_are_asked_one_at_a_time_in_key_order() {
+        let state = with_passes(generated());
+        let state = reduce(
+            state,
+            &Event::LessonRepeated {
+                lesson: "b lesson".into(),
+                text: "B lesson".into(),
+                count: 3,
+            },
+        );
+        let state = reduce(
+            state,
+            &Event::LessonRepeated {
+                lesson: "a lesson".into(),
+                text: "A lesson".into(),
+                count: 3,
+            },
+        );
+
+        let Some(Command::RequestHumanReview { artifact }) = next_command(&state) else {
+            panic!("expected the first promotion");
+        };
+        assert!(artifact.detail.unwrap().contains("\"A lesson\""));
+        assert_eq!(
+            pending_promotions(&state)
+                .into_iter()
+                .map(|(lesson, _)| lesson)
+                .collect::<Vec<_>>(),
+            vec!["a lesson".to_string(), "b lesson".to_string()]
+        );
+
+        let state = reduce(
+            state,
+            &Event::LessonDismissed {
+                reviewer: "dennis".into(),
+                lesson: "a lesson".into(),
+            },
+        );
+        let Some(Command::RequestHumanReview { artifact }) = next_command(&state) else {
+            panic!("expected the second promotion");
+        };
+        assert_eq!(
+            artifact.detail.as_deref(),
+            Some("lesson repeated 3 times: \"B lesson\"")
+        );
     }
 
     #[test]

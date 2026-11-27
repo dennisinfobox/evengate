@@ -24,6 +24,23 @@ pub enum Phase {
 pub struct ArtifactRef {
     pub path: String,
     pub kind: String,
+    /// Human-facing detail for a review request, such as a promotion proposal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// A lesson seen in several tasks, with one representative spelling.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepeatedLesson {
+    pub text: String,
+    pub count: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromotionDecision {
+    Promoted,
+    Dismissed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,6 +77,12 @@ pub struct State {
     /// Events that were recorded but did not fit the current phase. Replay
     /// stays total: an anomaly is data, never a panic.
     pub anomalies: Vec<String>,
+    /// Latest cross-task counts for lessons at or above the promotion threshold.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub repeated_lessons: BTreeMap<String, RepeatedLesson>,
+    /// Human promotion decisions for this task, keyed by canonical lesson.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub promotion_decisions: BTreeMap<String, PromotionDecision>,
 }
 
 impl Default for State {
@@ -83,6 +106,8 @@ impl Default for State {
             abandoned_reason: None,
             last_tick: None,
             anomalies: Vec::new(),
+            repeated_lessons: BTreeMap::new(),
+            promotion_decisions: BTreeMap::new(),
         }
     }
 }
@@ -134,6 +159,7 @@ pub fn reduce(mut state: State, event: &Event) -> State {
                         state.artifacts.push(ArtifactRef {
                             path: "project".into(),
                             kind: "tree".into(),
+                            detail: None,
                         });
                     }
                     state.phase = Phase::Verifying;
@@ -202,6 +228,33 @@ pub fn reduce(mut state: State, event: &Event) -> State {
                 state.abandoned_reason = Some(reason.clone());
             }
         }
+        Event::LessonRepeated {
+            lesson,
+            text,
+            count,
+        } => {
+            if state.phase != Phase::Verifying {
+                anomaly(&mut state, "lesson_repeated outside verifying");
+            }
+            let key = lesson.trim();
+            if key.is_empty() || *count == 0 {
+                anomaly(&mut state, "lesson_repeated without a lesson or count");
+            } else {
+                state.repeated_lessons.insert(
+                    key.to_string(),
+                    RepeatedLesson {
+                        text: text.clone(),
+                        count: *count,
+                    },
+                );
+            }
+        }
+        Event::LessonPromoted { lesson, .. } => {
+            record_promotion(&mut state, lesson, PromotionDecision::Promoted);
+        }
+        Event::LessonDismissed { lesson, .. } => {
+            record_promotion(&mut state, lesson, PromotionDecision::Dismissed);
+        }
         Event::PrOpened { url } => {
             if state.phase != Phase::Verifying {
                 anomaly(&mut state, "pr_opened outside verifying");
@@ -238,6 +291,18 @@ fn failures(results: &BTreeMap<GateId, GateResult>) -> BTreeMap<GateId, GateResu
         .collect()
 }
 
+fn record_promotion(state: &mut State, lesson: &str, decision: PromotionDecision) {
+    if state.phase != Phase::Verifying {
+        anomaly(state, "promotion decision outside verifying");
+    }
+    let key = lesson.trim();
+    if key.is_empty() || !state.repeated_lessons.contains_key(key) {
+        anomaly(state, "promotion decision for an unknown lesson");
+        return;
+    }
+    state.promotion_decisions.insert(key.to_string(), decision);
+}
+
 fn anomaly(state: &mut State, message: &str) {
     state.anomalies.push(message.to_string());
 }
@@ -272,6 +337,65 @@ mod tests {
                 },
             )
         })
+    }
+
+    fn generated() -> State {
+        let state = reduce(
+            created(),
+            &Event::AgentInvoked {
+                role: crate::event::AgentRole::Executor,
+                prompt_hash: "0".into(),
+            },
+        );
+        reduce(
+            state,
+            &Event::AgentResponded {
+                role: crate::event::AgentRole::Executor,
+                response: "r".into(),
+                tokens: TokenUsage::default(),
+            },
+        )
+    }
+
+    #[test]
+    fn repeated_lessons_and_promotion_decisions_are_recorded() {
+        let state = reduce(
+            generated(),
+            &Event::LessonRepeated {
+                lesson: "keep it small".into(),
+                text: "Keep it small.".into(),
+                count: 3,
+            },
+        );
+        assert_eq!(state.repeated_lessons["keep it small"].count, 3);
+        let state = reduce(
+            state,
+            &Event::LessonPromoted {
+                reviewer: "dennis".into(),
+                lesson: "keep it small".into(),
+            },
+        );
+        assert_eq!(
+            state.promotion_decisions["keep it small"],
+            PromotionDecision::Promoted
+        );
+        assert!(state.anomalies.is_empty());
+    }
+
+    #[test]
+    fn promotion_for_an_unknown_lesson_is_an_anomaly() {
+        let state = reduce(
+            generated(),
+            &Event::LessonDismissed {
+                reviewer: "dennis".into(),
+                lesson: "nope".into(),
+            },
+        );
+        assert!(state
+            .anomalies
+            .iter()
+            .any(|line| line.contains("unknown lesson")));
+        assert!(state.promotion_decisions.is_empty());
     }
 
     #[test]

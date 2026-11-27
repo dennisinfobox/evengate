@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use crate::event::{Event, GateResult};
 use crate::executor::ExecCtx;
 use crate::machine::Command;
-use crate::state::{Phase, State};
+use crate::state::{Phase, RepeatedLesson, State};
 
 const USAGE: &str = "\
 ev — Evengate control plane
@@ -29,6 +29,10 @@ Usage:
   ev reject <task-dir> --reviewer <name> --reason <text>
   ev revise <task-dir> --reviewer <name> [--reason <text>]
                                             re-run the executor with the gate failures
+  ev promote <task-dir> --reviewer <name> [--lesson <text>]
+                                            add a repeated lesson to rules/
+  ev dismiss <task-dir> --reviewer <name> [--lesson <text>]
+                                            decline promoting a repeated lesson
   ev abandon <task-dir> --reviewer <name> --reason <text>
   ev help
 ";
@@ -49,6 +53,8 @@ fn dispatch(args: &[String]) -> Result<(), String> {
         Some("approve") => decide(args, true),
         Some("reject") => decide(args, false),
         Some("revise") => revise(args),
+        Some("promote") => promotion_decision(args, true),
+        Some("dismiss") => promotion_decision(args, false),
         Some("abandon") => abandon(args),
         Some("help" | "--help" | "-h") | None => {
             print!("{USAGE}");
@@ -86,8 +92,12 @@ fn resume(task_dir: &Path, mut state: State) -> Result<(), String> {
     while let Some(command) = machine::next_command(&state) {
         if command.is_awaiting() {
             match &command {
-                Command::RequestHumanReview { .. } => {
-                    println!("ev: gate blocked; human review required");
+                Command::RequestHumanReview { artifact } => {
+                    if artifact.kind == "promotion" {
+                        println!("ev: promotion review required");
+                    } else {
+                        println!("ev: gate blocked; human review required");
+                    }
                     print_blockers(&state);
                 }
                 _ => println!("ev: waiting for a human decision"),
@@ -207,6 +217,14 @@ fn revise(args: &[String]) -> Result<(), String> {
         return Err(format!("no events in {}", task_dir.display()));
     }
     let state = fold(&events);
+    if state.phase == Phase::Verifying
+        && state::all_mandatory_passed(&state)
+        && !machine::pending_promotions(&state).is_empty()
+    {
+        return Err(
+            "task is paused for a promotion decision; use `ev promote` or `ev dismiss`".into(),
+        );
+    }
     let blocked = state.phase == Phase::Verifying
         && matches!(
             machine::next_command(&state),
@@ -238,6 +256,83 @@ fn revise(args: &[String]) -> Result<(), String> {
         machine::MAX_REVISIONS
     );
     resume(&task_dir, state)
+}
+
+fn promotion_decision(args: &[String], promote: bool) -> Result<(), String> {
+    let command = if promote { "promote" } else { "dismiss" };
+    let usage = format!("usage: ev {command} <task-dir> --reviewer <name> [--lesson <text>]");
+    let task_dir = PathBuf::from(args.get(1).ok_or(usage.clone())?);
+    let reviewer = flag(args, "--reviewer").ok_or(usage)?.to_string();
+    let mut events = log::read_events(&task_dir)
+        .map_err(|e| format!("cannot read {}: {e}", log::events_path(&task_dir).display()))?;
+    if events.is_empty() {
+        return Err(format!("no events in {}", task_dir.display()));
+    }
+    let state = fold(&events);
+    if state.phase != Phase::Verifying {
+        return Err(format!(
+            "task is in phase {}, not verifying",
+            phase_name(state.phase)
+        ));
+    }
+    if !state::all_mandatory_passed(&state) {
+        return Err("promotion is offered only after every gate passes".into());
+    }
+    let pending = machine::pending_promotions(&state);
+    if pending.is_empty() {
+        return Err("no lesson is pending promotion".into());
+    }
+    let index = match flag(args, "--lesson") {
+        Some(text) => {
+            let key = knowledge::canonical_lesson(text);
+            pending
+                .iter()
+                .position(|(pending_key, _)| pending_key == &key)
+                .ok_or_else(|| {
+                    format!(
+                        "`{text}` is not a pending lesson; pending: {}",
+                        pending_texts(&pending)
+                    )
+                })?
+        }
+        None if pending.len() == 1 => 0,
+        None => {
+            return Err(format!(
+                "several lessons are pending; pass --lesson <text>: {}",
+                pending_texts(&pending)
+            ))
+        }
+    };
+    let (lesson, repeated) = &pending[index];
+    if promote {
+        let path =
+            knowledge::append_rule(&executor::rules_root(), &spec::slug(&state.spec.title), &repeated.text)?;
+        println!("ev: promoted to {}", path.display());
+    }
+    let event = if promote {
+        Event::LessonPromoted {
+            reviewer,
+            lesson: lesson.clone(),
+        }
+    } else {
+        Event::LessonDismissed {
+            reviewer,
+            lesson: lesson.clone(),
+        }
+    };
+    log::append_event(&task_dir, &event).map_err(|e| format!("cannot append event: {e}"))?;
+    events.push(event);
+    let state = fold(&events);
+    log::write_state(&task_dir, &state).map_err(|e| format!("cannot write state: {e}"))?;
+    resume(&task_dir, state)
+}
+
+fn pending_texts(pending: &[(String, RepeatedLesson)]) -> String {
+    pending
+        .iter()
+        .map(|(_, repeated)| format!("\"{}\"", repeated.text))
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 fn abandon(args: &[String]) -> Result<(), String> {
@@ -275,6 +370,18 @@ fn print_blockers(state: &State) {
                 println!("ev:   {}: {question}", gate::label(*id))
             }
             GateResult::Pass => {}
+        }
+    }
+    if state::all_mandatory_passed(state) {
+        let pending = machine::pending_promotions(state);
+        if !pending.is_empty() {
+            for (_, repeated) in &pending {
+                println!(
+                    "ev:   promotion: lesson repeated {} times: \"{}\"",
+                    repeated.count, repeated.text
+                );
+            }
+            println!("ev:   use `ev promote` or `ev dismiss` to decide");
         }
     }
     if state.revisions >= machine::MAX_REVISIONS {
