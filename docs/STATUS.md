@@ -2,22 +2,22 @@
 
 Last updated: 2026-11-27
 
-**Phase:** 1 — First tasks (week 5–6). The knowledge loop is closed: the review agent's lessons become the next executor's context.
+**Phase:** 1 — First tasks (week 5–6). First real-model task completed the gates and is parked at human approval.
 
 **Done since last handoff:**
-- The reviewer verdict now carries `lessons` (3–5 bullets). The executor writes them to `lessons/<task-id>.md`, overwriting on a revision, under `EVENGATE_LESSONS_DIR` (default `lessons/`).
-- Executor prompt assembly includes the five most recent lesson files, newest first by modification time with file-name ties, and states that the current spec and constraints win. The reviewer prompt is unchanged.
-- No new event: the raw verdict stays in `AgentResponded`, so the file is reconstructible and `ev replay` remains a pure fold.
-- Spec bumped to v0.7 (§7.5, §7.6, §7.8); ADR-0010 recorded; README documents the lessons directory.
-- Checks pass: `cargo check --locked`, `cargo test --locked` (63 tests), `cargo clippy --locked -- -D warnings`.
-- End-to-end against a local OpenAI-compatible stub: task A wrote `lessons/knowledge-smoke-a.md`; task B's recorded executor prompt contained the lessons section and both bullets, while its reviewer prompt did not.
+- Ran real tasks against the local Ollama OpenAI-compatible endpoint with `qwen2.5-coder:14b`.
+- `tasks/sum-cli`: first manifest was malformed JSON (retried), then the deterministic gates passed but the reviewer rejected weak tests. One revision produced a pure `parse_args`, real valid/invalid tests, and all four gates passed; the PR is open and awaits owner approval. Lessons were written to `lessons/sum-cli.md`.
+- `tasks/word-count`: tests failed because the model used the forbidden `tempfile` crate. Revision 1 fixed that but broke a test import; revision 2 fixed byte counting but repeated the same import error. The two-revision cap stopped the task, as designed.
+- These runs exposed and fixed two defects: gate failures now report the first actionable diagnostic (compiler error, panic, clippy warning) instead of cargo's `Compiling`/`Checking` line, and revision prompts now include the current project tree instead of only the reference template.
+- Spec bumped to v0.8 (§7.3, §7.4); README updated.
+- Checks pass: `cargo check --locked`, `cargo test --locked` (67 tests), `cargo clippy --locked -- -D warnings`.
 
-**In flight:** nothing.
+**In flight:** `tasks/sum-cli` is in `Reviewing`; owner approval is the remaining gate.
 
 **Next:**
-1. Run one task against a real OpenAI-compatible endpoint and land the first model-authored project.
-2. Sandbox hardening; an execution replay path to rebuild a gitignored `project/` from the log.
-3. Wire `rules/<project>.md` and `codebase-map.md` into prompt assembly, and implement the ≥3-occurrence promotion path from §7.8.
+1. Owner reviews the `sum-cli` PR and runs `ev approve tasks/sum-cli --reviewer <name>`, then `ev replay tasks/sum-cli`.
+2. Decide the capped `word-count` task: abandon it or rerun from a sharper spec.
+3. Sandbox hardening; an execution replay path to rebuild a gitignored `project/` from the log; `rules/<project>.md` and `codebase-map.md` prompt inputs.
 
 **Blockers:** none.
 
