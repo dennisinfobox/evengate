@@ -8,11 +8,12 @@ Last updated: 2026-11-28
 - Closed the `tasks/hello` question: it stays frozen as the seed-run record. Its snapshot predates the mandatory `ReviewAgent` gate, so `ev replay tasks/hello` is expected to exit with the `merged without passed gates and human approval` anomaly. No gate event was fabricated and the snapshot was not regenerated. Spec v0.13 scopes the replay guarantee to the reducer that wrote the snapshot; ADR-0015 records the decision, `tasks/hello/README.md` states the provenance.
 - README quickstart now replays and materializes `tasks/sum-cli` (byte-identical) and uses `<task-dir>` placeholders for decisions; spec version reference corrected.
 - Re-verified the mechanism on copies: `replay tasks/hello` → mismatch plus anomaly, `replay tasks/sum-cli` → 37 events, byte-identical.
+- Prepared `tasks/sum-cli-nary/spec.md`, the second task in the `sum-cli` project: sum any number of integer arguments with `i64` overflow reported as an error, plus tests for valid, negative, missing, invalid, and overflow inputs. The title stays `Sum CLI` so the project slug — and therefore `rules/sum-cli.md` — matches the first task. Verified the spec parses by starting it against a missing template directory; `TaskCreated` was recorded and the run stopped before any agent or gate.
 
 **In flight:** nothing.
 
 **Next:**
-1. Run a second task to exercise the lessons/rules feedback loop end to end (week 5–6 exit criterion). The promotion threshold needs three lesson files sharing a canonical lesson before it fires naturally. Requires a live model endpoint in the shell (`EVENGATE_LLM_URL`, `EVENGATE_LLM_API_KEY`, `EVENGATE_MODEL` or per-role models) and an owner-chosen spec.
+1. Run `tasks/sum-cli-nary/spec.md` to exercise the lessons/rules feedback loop end to end (week 5–6 exit criterion). The prompt must visibly carry `lessons/sum-cli.md` into the second task. The promotion threshold then needs a third lesson file sharing a canonical lesson before it fires naturally. Requires a live model endpoint in the shell (`EVENGATE_LLM_URL`, `EVENGATE_LLM_API_KEY`, `EVENGATE_MODEL` or per-role models).
 2. `codebase-map.md` joins prompt assembly once a planner role has a consumer.
 
 **Blockers:** No live-model configuration (`EVENGATE_*`) is present in this environment, so the second-task run cannot start here.
