@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 // Built from `sandbox/Dockerfile`; the official image lacks clippy/rustfmt.
 pub const DEFAULT_IMAGE: &str = "evengate-sandbox:1.100";
 const OUTPUT_CAP: usize = 1024 * 1024;
+const TMPFS_SIZE: &str = "1g";
 
 #[derive(Debug, Clone)]
 pub struct RunOutput {
@@ -23,17 +24,36 @@ pub struct RunOutput {
 pub struct Sandbox {
     image: String,
     timeout: Duration,
+    memory: String,
+    cpus: String,
+    pids: String,
+}
+
+fn env_or(key: &str, default: &str) -> String {
+    env::var(key)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| default.to_string())
 }
 
 impl Sandbox {
     pub fn from_env() -> Self {
-        let image = env::var("EVENGATE_SANDBOX_IMAGE").unwrap_or_else(|_| DEFAULT_IMAGE.to_string());
+        let image = env_or("EVENGATE_SANDBOX_IMAGE", DEFAULT_IMAGE);
         let timeout = env::var("EVENGATE_SANDBOX_TIMEOUT_SECS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .map(Duration::from_secs)
             .unwrap_or(Duration::from_secs(300));
-        Sandbox { image, timeout }
+        let memory = env_or("EVENGATE_SANDBOX_MEMORY", "2g");
+        let cpus = env_or("EVENGATE_SANDBOX_CPUS", "2");
+        let pids = env_or("EVENGATE_SANDBOX_PIDS", "256");
+        Sandbox {
+            image,
+            timeout,
+            memory,
+            cpus,
+            pids,
+        }
     }
 
     pub fn run(&self, workdir: &Path, argv: &[&str]) -> io::Result<RunOutput> {
@@ -41,9 +61,23 @@ impl Sandbox {
         let mut child = Command::new("docker")
             .arg("run")
             .arg("--rm")
+            .arg("--init")
             .arg("--network=none")
+            .arg("--memory")
+            .arg(&self.memory)
+            .arg("--memory-swap")
+            .arg(&self.memory)
+            .arg("--pids-limit")
+            .arg(&self.pids)
+            .arg("--cpus")
+            .arg(&self.cpus)
+            .arg("--cap-drop=ALL")
+            .arg("--security-opt=no-new-privileges")
+            .arg("--read-only")
+            .arg("--tmpfs")
+            .arg(format!("/tmp:rw,exec,size={TMPFS_SIZE}"))
             .arg("-v")
-            .arg(format!("{dir}:/work"))
+            .arg(format!("{dir}:/work:ro"))
             .arg("-w")
             .arg("/work")
             .arg("-e")

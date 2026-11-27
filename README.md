@@ -36,7 +36,9 @@ cargo run --locked --bin ev -- abandon tasks/hello --reviewer <your-name> --reas
 
 Binaries: `ev` (daily use) and `evengate` (scripts, CI), both built from `src/main.rs`.
 
-Environment: `EVENGATE_SANDBOX_IMAGE`, `EVENGATE_SANDBOX_TIMEOUT_SECS`, `EVENGATE_TEMPLATES`, `EVENGATE_LESSONS_DIR` (default `lessons/`).
+Environment: `EVENGATE_SANDBOX_IMAGE`, `EVENGATE_SANDBOX_TIMEOUT_SECS`, `EVENGATE_SANDBOX_MEMORY` (default `2g`), `EVENGATE_SANDBOX_CPUS` (default `2`), `EVENGATE_SANDBOX_PIDS` (default `256`), `EVENGATE_TEMPLATES`, `EVENGATE_LESSONS_DIR` (default `lessons/`).
+
+Gate containers run read-only with no network, a read-only project mount, a 1 GiB executable `/tmp`, dropped capabilities, `no-new-privileges`, and the memory/PID/CPU caps above.
 
 The executing agent defaults to the offline `TemplateClient`. Set `EVENGATE_LLM_URL` (an OpenAI-compatible chat-completions endpoint) to switch to `LiveClient`; `EVENGATE_LLM=template|live|recorded` overrides the choice. Live mode reads `EVENGATE_LLM_API_KEY`, `EVENGATE_MODEL_EXECUTOR`/`_PLANNER`/`_REVIEWER` (fallback `EVENGATE_MODEL`), `EVENGATE_LLM_TIMEOUT_SECS`, and `EVENGATE_LLM_MAX_TOKENS`.
 

@@ -1,6 +1,8 @@
-# Evengate — Technical Specification v0.9
+# Evengate — Technical Specification v0.10
 
 > A deterministic, Rust-native software factory that builds and improves itself under human oversight, and later produces pet projects in a familiar way.
+
+**Changes from v0.9:** gate containers gain read-only filesystems, read-only project mounts, a bounded writable `/tmp`, and memory, swap, PID, and CPU caps; capabilities are dropped and privileges cannot escalate (§7.7, ADR-0012).
 
 **Changes from v0.8:** `ev materialize <task-id>` is execution replay: it rebuilds the gitignored `project/` tree and `lessons/<task-id>.md` from `AgentResponded` events in log order, without a model or network (§6.3, §7.4, §7.8, ADR-0011).
 
@@ -330,14 +332,18 @@ pub trait Gate {
 ### 7.7 `sandbox.rs` — process isolation
 
 - Linux: `bwrap` or `firejail` invoked via `std::process::Command`.
-- Cross-platform: `docker run --rm --network=none -v <workdir>:<workdir>`.
+- Cross-platform: `docker run --rm --network=none -v <workdir>:/work:ro`.
 
 **Mandatory constraints for every spawned process:**
 
 - Network disabled, except an explicit allowlist to the LLM API endpoint (or no network at all when the LLM runs outside the sandbox).
-- Working directory is a **copy** of the task's project directory.
+- Working directory is a **copy** of the task's project directory, mounted **read-only**.
+- Read-only container root. The only writable path is a 1 GiB executable `/tmp` tmpfs, which holds `CARGO_TARGET_DIR` and compiler scratch files.
+- Memory and swap capped (default 2 GiB each, so the container cannot swap), PID count capped (default 256), CPU capped (default 2).
+- All Linux capabilities dropped, `no-new-privileges` set, and an init process reaps orphans.
 - Wall-clock timeout (default: 300s).
 - Output size cap (default: 1 MiB per stream); excess is truncated with a marker.
+- Limits are overridable with `EVENGATE_SANDBOX_MEMORY`, `EVENGATE_SANDBOX_CPUS`, and `EVENGATE_SANDBOX_PIDS`.
 
 ### 7.8 `knowledge.rs` — the accumulator
 
