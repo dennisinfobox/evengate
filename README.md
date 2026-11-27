@@ -46,7 +46,7 @@ When a gate blocks a task, `ev revise` re-runs the executor with the failing ver
 
 The review agent also returns 3–5 lessons. The executor writes them to `lessons/<task-id>.md`, and the next executor prompt includes the five most recent lesson files; the current spec always wins over inherited advice.
 
-`project/` and `lessons/` are derived state. `ev materialize <task-dir>` rebuilds both from `events.jsonl` without a model or network: the last executor manifest becomes `project/`, and the last usable reviewer verdict becomes the lesson file. `state.json` is untouched.
+`project/` and `lessons/` are derived state. `ev materialize <task-dir>` rebuilds both from `events.jsonl` without a model or network: the last executor manifest becomes `project/`, and the last usable reviewer verdict becomes the lesson file. `state.json` is untouched. Only recorded files are recreated, so a local `.git` or `target/` inside `project/` is dropped; the bare remote under `artifacts/` is not.
 
 ## Working on it
 

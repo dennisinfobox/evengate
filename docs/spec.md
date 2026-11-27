@@ -153,7 +153,7 @@ tasks/<task-id>/
 
 **Replay guarantee:** `ev replay <task-id>` reads `events.jsonl`, folds through `reduce`, and produces a `State` identical to the live run. Live LLM responses are recorded as events, so replay never calls the network.
 
-**Execution replay:** `ev materialize <task-id>` reconstructs the gitignored `project/` tree and `lessons/<task-id>.md` from `AgentResponded` events in log order. The last executor manifest wins; the last usable reviewer verdict supplies the lesson. It calls no model, spawns nothing, and leaves `state.json` untouched, so the pure-fold guarantee of `ev replay` is unchanged.
+**Execution replay:** `ev materialize <task-id>` reconstructs the gitignored `project/` tree and `lessons/<task-id>.md` from `AgentResponded` events in log order. The last executor manifest wins; the last usable reviewer verdict supplies the lesson. It calls no model, spawns nothing, and leaves `state.json` untouched, so the pure-fold guarantee of `ev replay` is unchanged. Only recorded files are recreated: a local `.git` or `target/` inside `project/` is dropped, and the bare remote under `artifacts/` is untouched.
 
 **Formal contract:**
 
