@@ -108,8 +108,11 @@ pub(crate) fn strip_fence(text: &str) -> &str {
     let Some(rest) = text.strip_prefix("```") else {
         return text;
     };
-    let rest = rest.strip_prefix("json").unwrap_or(rest);
-    let rest = rest.trim_start_matches(['\r', '\n']);
+    // Drop the language tag on the opening fence line, if any.
+    let rest = match rest.find('\n') {
+        Some(index) => &rest[index + 1..],
+        None => rest,
+    };
     let rest = rest.strip_suffix("```").unwrap_or(rest);
     rest.trim()
 }

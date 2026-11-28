@@ -1,6 +1,8 @@
-# Evengate — Technical Specification v0.18
+# Evengate — Technical Specification v0.19
 
 > A deterministic, Rust-native software factory that builds and improves itself under human oversight, and later produces pet projects in a familiar way.
+
+**Changes from v0.18:** a self-edit with exactly one file target returns that file's complete contents as plain text, not a JSON manifest, so a Rust attribute quote cannot truncate the response. Multiple targets or a directory target keep the manifest (§7.4, §7.5, ADR-0025).
 
 **Changes from v0.17:** self-edits are partial. `TaskCreated` is followed by `SelfEditBase`, a recorded repository tree; the executor sees only the target files plus a repository path map and returns only changed files; the review gate sees only files changed against the base; and the PR commits the base tree on `main` before the feature branch, so the human reviews a diff (§7.1, §7.4–§7.6, §10.2, ADR-0023, ADR-0024).
 
@@ -284,7 +286,7 @@ The executor must never mutate `State` directly. It only returns events. A faili
 
 The same module owns `materialize`: it applies recorded executor manifests and reviewer lessons to disk in log order. It is the impure counterpart to `ev replay`, not part of the `Command` loop, and it never changes the log or the snapshot.
 
-**Self-edit tasks.** A spec whose `## Target` lists a path under `src/` is a self-improvement task (§10.2). When `ev run` creates the task, it reads this repository — excluding `.git`, `target`, `.tmp`, and the generated `tasks/*/project` and `tasks/*/artifacts` trees — and records it as `SelfEditBase` immediately after `TaskCreated`. The base is therefore in the log before any model call, and `project/` is rebuilt from it rather than from the live checkout. The executor prompt carries the target files and a repository path map; the agent returns only the files it changed. The response overlays `project/`, so an unlisted file survives; deletions are not supported in v0. The copy is the separate checkout the deterministic gates judge in the sandbox, so the live working tree is never mutated. The offline `TemplateClient` refuses a self-edit, because rendering `templates/bin` would replace Evengate with an unrelated crate. When the PR opens, `main` is committed from `SelfEditBase` first, so the feature branch is a real diff.
+**Self-edit tasks.** A spec whose `## Target` lists a path under `src/` is a self-improvement task (§10.2). When `ev run` creates the task, it reads this repository — excluding `.git`, `target`, `.tmp`, and the generated `tasks/*/project` and `tasks/*/artifacts` trees — and records it as `SelfEditBase` immediately after `TaskCreated`. The base is therefore in the log before any model call, and `project/` is rebuilt from it rather than from the live checkout. The executor prompt carries the target files and a repository path map; the agent returns only the files it changed. A single-file self-edit returns that file as plain text; a directory or multi-file self-edit returns the manifest. The response overlays `project/`, so an unlisted file survives; deletions are not supported in v0. The copy is the separate checkout the deterministic gates judge in the sandbox, so the live working tree is never mutated. The offline `TemplateClient` refuses a self-edit, because rendering `templates/bin` would replace Evengate with an unrelated crate. When the PR opens, `main` is committed from `SelfEditBase` first, so the feature branch is a real diff.
 
 ### 7.5 `llm/` — the model boundary
 
@@ -307,7 +309,7 @@ pub struct TemplateClient { /* offline: renders templates/ into a manifest */ }
 {"files": {"src/main.rs": "fn main() {}\n"}}
 ```
 
-The executor validates every path (relative, `/` separators, no `.`/`..`, bounded count and size), replaces `project/` with the manifest, and only then runs the gates. Prompt assembly is deterministic: the full spec and the reference template are rendered in declaration/sorted order, so the recorded prompt hash is reproducible.
+A self-edit with exactly one file target skips JSON: the model returns that file's complete contents as plain text, and a fenced block is unwrapped. A directory target or several targets uses the manifest. The executor validates every path (relative, `/` separators, no `.`/`..`, bounded count and size), replaces `project/` for a generated project, overlays it for a self-edit, and only then runs the gates. Prompt assembly is deterministic: the full spec and the reference template are rendered in declaration/sorted order, so the recorded prompt hash is reproducible.
 
 **Review protocol.** The reviewer answers one JSON object with an approval, concrete issues, and 3–5 short lessons:
 

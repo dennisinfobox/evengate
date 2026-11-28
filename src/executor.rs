@@ -120,6 +120,13 @@ fn read_self_edit_base(task_dir: &Path) -> Result<Option<BTreeMap<String, String
 
 fn repo_root(task_dir: &Path) -> Result<PathBuf, String> {
     for dir in task_dir.ancestors() {
+        // A relative task path ends in the empty ancestor, which `read_dir`
+        // cannot open; the current directory is the same repository root.
+        let dir = if dir.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            dir
+        };
         if dir.join(".git").exists() && dir.join("Cargo.toml").is_file() && dir.join("src").is_dir()
         {
             return Ok(dir.to_path_buf());
@@ -129,6 +136,35 @@ fn repo_root(task_dir: &Path) -> Result<PathBuf, String> {
         "self-edit task {} is not inside the Evengate repository",
         task_dir.display()
     ))
+}
+
+/// A self-edit with exactly one file target can return that file directly,
+/// which avoids JSON escaping of Rust attributes. A directory target or
+/// several targets keep the manifest protocol.
+fn single_file_target(context: &Context, files: &BTreeMap<String, String>) -> Option<String> {
+    if context.target.len() != 1 {
+        return None;
+    }
+    let clean = context.target[0].trim().replace('\\', "/");
+    let clean = clean.trim_end_matches('/');
+    if files.contains_key(clean) {
+        Some(clean.to_string())
+    } else {
+        None
+    }
+}
+
+fn parse_executor_response(text: &str, raw_target: Option<&str>) -> Result<FileManifest, String> {
+    if let Some(path) = raw_target {
+        let content = format!("{}\n", llm::strip_fence(text).trim_end());
+        if content.trim().is_empty() {
+            return Err(format!("agent returned an empty `{path}`"));
+        }
+        let mut files = BTreeMap::new();
+        files.insert(path.to_string(), content);
+        return Ok(FileManifest { files });
+    }
+    FileManifest::parse(text)
 }
 
 fn target_covers(target: &str, path: &str) -> bool {
@@ -295,7 +331,7 @@ pub fn materialize(task_dir: &Path, lessons_dir: &Path) -> Result<MaterializeRep
         files: 0,
         lesson: false,
     };
-    if ctx.self_edit {
+    let base = if ctx.self_edit {
         let files = events
             .iter()
             .find_map(|event| match event {
@@ -303,8 +339,20 @@ pub fn materialize(task_dir: &Path, lessons_dir: &Path) -> Result<MaterializeRep
                 _ => None,
             })
             .ok_or("self-edit log has no SelfEditBase event")?;
-        report.files += apply_manifest(&FileManifest { files }, &ctx.project_dir(), false)?;
-    }
+        report.files += apply_manifest(
+            &FileManifest {
+                files: files.clone(),
+            },
+            &ctx.project_dir(),
+            false,
+        )?;
+        Some(files)
+    } else {
+        None
+    };
+    let raw_target = base
+        .as_ref()
+        .and_then(|files| single_file_target(&ctx.context, files));
     for event in &events {
         if let Event::AgentResponded {
             role: AgentRole::Executor,
@@ -312,7 +360,7 @@ pub fn materialize(task_dir: &Path, lessons_dir: &Path) -> Result<MaterializeRep
             ..
         } = event
         {
-            let manifest = FileManifest::parse(response)?;
+            let manifest = parse_executor_response(response, raw_target.as_deref())?;
             report.files += apply_manifest(&manifest, &ctx.project_dir(), ctx.self_edit)?;
             report.responses += 1;
         }
@@ -396,7 +444,7 @@ fn invoke_agent(role: AgentRole, context: &Context, ctx: &ExecCtx) -> Result<Vec
     let client = client_for(ctx, role)?;
     let lessons = knowledge::recent_lessons(&ctx.lessons_dir, knowledge::RECENT_LESSONS)?;
     let rules = knowledge::read_rules(&ctx.rules_dir, &ctx.project_name)?;
-    let (current, repository_files) = if ctx.self_edit {
+    let (current, repository_files, single_file) = if ctx.self_edit {
         ctx.seed_self_edit()?;
         let all = read_project_files(&ctx.project_dir())?;
         let selected = all
@@ -404,11 +452,16 @@ fn invoke_agent(role: AgentRole, context: &Context, ctx: &ExecCtx) -> Result<Vec
             .filter(|(path, _)| target_covers_any(&context.target, path))
             .map(|(path, content)| (path.clone(), content.clone()))
             .collect();
-        (Some(selected), all.keys().cloned().collect())
+        let single = single_file_target(context, &all);
+        (Some(selected), all.keys().cloned().collect(), single)
     } else if !context.feedback.is_empty() {
-        (Some(read_project_files(&ctx.project_dir())?), Vec::new())
+        (
+            Some(read_project_files(&ctx.project_dir())?),
+            Vec::new(),
+            None,
+        )
     } else {
-        (None, Vec::new())
+        (None, Vec::new(), None)
     };
     let prompt = build_prompt(
         context,
@@ -417,10 +470,11 @@ fn invoke_agent(role: AgentRole, context: &Context, ctx: &ExecCtx) -> Result<Vec
         rules.as_deref(),
         current.as_ref(),
         &repository_files,
+        single_file.as_deref(),
     )?;
     let request = LlmRequest { role, prompt };
     let response = client.complete(&request)?;
-    let manifest = FileManifest::parse(&response.text)?;
+    let manifest = parse_executor_response(&response.text, single_file.as_deref())?;
     apply_manifest(&manifest, &ctx.project_dir(), ctx.self_edit)?;
     Ok(vec![
         Event::AgentInvoked {
@@ -444,6 +498,7 @@ fn build_prompt(
     rules: Option<&str>,
     current: Option<&BTreeMap<String, String>>,
     repository_files: &[String],
+    raw_target: Option<&str>,
 ) -> Result<String, String> {
     let self_edit = context.target.iter().any(|path| spec::targets_self(path));
     let mut prompt = String::new();
@@ -497,15 +552,22 @@ fn build_prompt(
         }
     }
 
-    prompt.push_str(
-        "\n# Output\nReturn one JSON object and nothing else:\n\
-         {\"files\": {\"relative/path\": \"file contents\"}}\n\
-         Every path must be relative, use `/`, and contain no `..`. Include every file the project needs.\n",
-    );
-    if self_edit {
-        prompt.push_str(
-            "Return only the files you changed. Every unlisted path stays as it is; this task cannot delete files.\n",
+    if let Some(target) = raw_target {
+        let _ = writeln!(
+            prompt,
+            "\n# Output\nReturn the complete contents of `{target}` and nothing else. Do not wrap the file in JSON, Markdown fences, or commentary. End the file with a newline."
         );
+    } else {
+        prompt.push_str(
+            "\n# Output\nReturn one JSON object and nothing else:\n\
+             {\"files\": {\"relative/path\": \"file contents\"}}\n\
+             Every path must be relative, use `/`, and contain no `..`. Include every file the project needs.\n",
+        );
+        if self_edit {
+            prompt.push_str(
+                "Return only the files you changed. Every unlisted path stays as it is; this task cannot delete files.\n",
+            );
+        }
     }
     Ok(prompt)
 }
@@ -1048,7 +1110,7 @@ mod tests {
             open_questions: Vec::new(),
             feedback: Vec::new(),
         };
-        let prompt = build_prompt(&context, &template, &[], None, None, &[]).unwrap();
+        let prompt = build_prompt(&context, &template, &[], None, None, &[], None).unwrap();
         assert!(prompt.contains("make a crate"));
         assert!(prompt.contains("- it compiles"));
         assert!(prompt.contains("- no crates"));
@@ -1058,7 +1120,7 @@ mod tests {
         assert!(!prompt.contains("{{crate_name}}"));
         assert_eq!(
             prompt,
-            build_prompt(&context, &template, &[], None, None, &[]).unwrap()
+            build_prompt(&context, &template, &[], None, None, &[], None).unwrap()
         );
 
         fs::remove_dir_all(&root).unwrap();
@@ -1169,6 +1231,7 @@ mod tests {
             None,
             Some(&current),
             &repository,
+            Some("src/gate.rs"),
         )
         .unwrap();
         assert!(prompt.starts_with("Edit the existing Evengate project"));
@@ -1176,11 +1239,36 @@ mod tests {
         assert!(prompt.contains("# Repository files\n- Cargo.toml\n- src/gate.rs"));
         assert!(prompt.contains("# Files to edit"));
         assert!(prompt.contains("--- src/gate.rs ---\nfn gate() {}"));
-        assert!(prompt.contains("Return only the files you changed"));
-        assert!(prompt.contains("cannot delete files"));
+        assert!(prompt.contains("Return the complete contents of `src/gate.rs`"));
+        assert!(!prompt.contains("\"files\""));
         assert!(!prompt.contains("# Current project"));
-        assert!(!prompt.contains("complete repository tree"));
         assert!(!prompt.contains("# Reference template"));
+
+        let manifest_prompt = build_prompt(
+            &context,
+            Path::new("no-such-template-dir"),
+            &[],
+            None,
+            Some(&current),
+            &repository,
+            None,
+        )
+        .unwrap();
+        assert!(manifest_prompt.contains("Return only the files you changed"));
+        assert!(manifest_prompt.contains("cannot delete files"));
+    }
+
+    #[test]
+    fn single_file_responses_accept_raw_text_and_fences() {
+        let raw = parse_executor_response("fn main() { changed }\n", Some("src/main.rs")).unwrap();
+        assert_eq!(raw.files["src/main.rs"], "fn main() { changed }\n");
+
+        let fenced =
+            parse_executor_response("```rust\nfn main() { changed }\n```", Some("src/main.rs"))
+                .unwrap();
+        assert_eq!(fenced.files["src/main.rs"], "fn main() { changed }\n");
+
+        assert!(parse_executor_response("  \n", Some("src/main.rs")).is_err());
     }
 
     #[test]
@@ -1206,6 +1294,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .unwrap();
         assert!(prompt.starts_with("Revise the existing project"));
@@ -1234,6 +1323,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .unwrap();
         assert!(prompt.contains("# Lessons from previous tasks"));
@@ -1261,6 +1351,7 @@ mod tests {
             Some("No unsafe code.\nNo network."),
             None,
             &[],
+            None,
         )
         .unwrap();
         assert!(prompt.contains("# Project rules\n"));
@@ -1277,6 +1368,7 @@ mod tests {
                 Some("No unsafe code.\nNo network."),
                 None,
                 &[],
+                None,
             )
             .unwrap()
         );
@@ -1310,6 +1402,7 @@ mod tests {
             None,
             Some(&current),
             &[],
+            None,
         )
         .unwrap();
         assert!(prompt.contains("# Current project"));
@@ -1535,7 +1628,7 @@ mod tests {
             &task,
             &Event::AgentResponded {
                 role: AgentRole::Executor,
-                response: r#"{"files":{"src/main.rs":"fn main() { changed }\n"}}"#.into(),
+                response: "fn main() { changed }\n".into(),
                 tokens: Default::default(),
             },
         )

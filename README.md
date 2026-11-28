@@ -10,7 +10,7 @@ Status: month 2 — self-edit tasks record a base tree, return partial edits, ru
 
 | File | Purpose |
 |---|---|
-| [`docs/spec.md`](docs/spec.md) | Authoritative design, v0.18 |
+| [`docs/spec.md`](docs/spec.md) | Authoritative design, v0.19 |
 | [`docs/STATUS.md`](docs/STATUS.md) | Current phase, next step, blockers |
 | [`docs/DECISIONS.md`](docs/DECISIONS.md) | Decision log with rationale |
 | [`AGENTS.md`](AGENTS.md) | Rules for agents and contributors |
@@ -52,7 +52,7 @@ The executing agent defaults to the offline `TemplateClient`. Set `EVENGATE_LLM_
 
 The `ReviewAgent` gate is mandatory and needs a model. With no endpoint configured, `ev run` executes the template agent and the four deterministic gates — `cargo check`, `cargo test`, `cargo clippy -- -D warnings`, and `cargo fmt --check` — then stops at the review gate with an actionable error; re-run with `EVENGATE_LLM_URL` set to finish the review and open the PR. `ev replay` is always offline.
 
-A task spec with a `## Target` bullet under `src/` is a self-edit. `ev run` records the repository tree as `SelfEditBase` (without `.git`, `target`, `.tmp`, or generated task artifacts), seeds `tasks/<task-dir>/project/` from it, and sends only the target files plus a repository path map to the executor. The agent returns only changed files; they overlay the base. The gates judge that copy in the sandbox, so the live checkout is untouched. A self-edit needs a model: the offline template agent refuses, because rendering `templates/bin` would replace Evengate with an unrelated crate. The review prompt sees only the files changed against the base, and the PR commits the base tree on `main` first, so the human reviews a diff. The sandbox image pre-fetches the locked dependency set at build time, so `cargo check`, `test`, `clippy`, and `fmt` run offline on the copy.
+A task spec with a `## Target` bullet under `src/` is a self-edit. `ev run` records the repository tree as `SelfEditBase` (without `.git`, `target`, `.tmp`, or generated task artifacts), seeds `tasks/<task-dir>/project/` from it, and sends only the target files plus a repository path map to the executor. The agent returns only changed files; they overlay the base. A single-file target returns that file as plain text (no JSON escaping), while a directory or multi-file target returns the manifest. The gates judge that copy in the sandbox, so the live checkout is untouched. A self-edit needs a model: the offline template agent refuses, because rendering `templates/bin` would replace Evengate with an unrelated crate. The review prompt sees only the files changed against the base, and the PR commits the base tree on `main` first, so the human reviews a diff. The sandbox image pre-fetches the locked dependency set at build time, so `cargo check`, `test`, `clippy`, and `fmt` run offline on the copy.
 
 `TaskCreated` records the mandatory gate set in force for that task, so adding or removing a gate never reinterprets an old log. A task whose recorded set differs from the running binary's can merge only with `ev approve <task-dir> --reviewer <name> --reason <text>`; a bare approval stops at `RequestHumanReview`.
 
