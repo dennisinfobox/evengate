@@ -9,7 +9,8 @@ use crate::event::{AgentRole, Event, GateId, GateResult};
 use crate::gate;
 use crate::knowledge::{self, Lesson};
 use crate::llm::{
-    self, FileManifest, LiveClient, LlmClient, LlmRequest, RecordedClient, TemplateClient,
+    self, FileManifest, LiveClient, LlmClient, LlmRequest, RecordedClient, RequestFormat,
+    TemplateClient,
 };
 use crate::machine::{Command, Context, Outcome};
 use crate::sandbox::{self, RunOutput, Sandbox};
@@ -472,7 +473,16 @@ fn invoke_agent(role: AgentRole, context: &Context, ctx: &ExecCtx) -> Result<Vec
         &repository_files,
         single_file.as_deref(),
     )?;
-    let request = LlmRequest { role, prompt };
+    let format = if single_file.is_some() {
+        RequestFormat::SingleFile
+    } else {
+        RequestFormat::Default
+    };
+    let request = LlmRequest {
+        role,
+        prompt,
+        format,
+    };
     let response = client.complete(&request)?;
     let manifest = parse_executor_response(&response.text, single_file.as_deref())?;
     apply_manifest(&manifest, &ctx.project_dir(), ctx.self_edit)?;
@@ -789,6 +799,7 @@ fn run_review_gate(ctx: &ExecCtx) -> Result<Vec<Event>, String> {
     let request = LlmRequest {
         role: AgentRole::Reviewer,
         prompt,
+        format: RequestFormat::Default,
     };
     let client = client_for(ctx, AgentRole::Reviewer)?;
     let response = client.complete(&request)?;

@@ -10,8 +10,8 @@ Last updated: 2026-11-28
 - The review prompt for a self-edit carries the task spec, the path map, and only the files that differ from `SelfEditBase`, plus a deleted-file list. A non-self-edit task still reviews the complete project.
 - `ev materialize` writes `SelfEditBase` first and then overlays every executor response, so execution replay needs no live checkout.
 - A self-edit PR commits `SelfEditBase` on `main` as `ev: initialize <project>` before the feature branch; `git diff main..ev/<project>` contains only the change. Generated projects keep the empty base commit.
-- The first real self-edit attempt exposed a model failure: the JSON manifest ended at the first unescaped quote in a serde attribute, the parser accepted the shortened string, and `Compiles` rejected the unclosed delimiter. A single-file self-edit now returns the file as plain text instead; a fence is unwrapped and a trailing newline is ensured. That failed task was abandoned and removed.
-- Checks: 106 tests per binary, `cargo check --locked`, `cargo clippy --locked -- -D warnings`, and `cargo fmt --check` pass. `sum-cli` (37), `sum-cli-nary` (39), `sum-cli-help` (47), and `word-count` (28) replay byte-identically.
+- The first two real self-edit attempts exposed model failures: `qwen2.5-coder:14b` truncated the JSON manifest at the first unescaped serde attribute quote, and `llama3.1:8b` returned a JSON map instead of the file. A single-file self-edit now switches to `RequestFormat::SingleFile`, whose system prompt demands the file and nothing else; the format is in the prompt hash, a fence is unwrapped, and a trailing newline is ensured. Both failed tasks were abandoned and removed.
+- Checks: 107 tests per binary, `cargo check --locked`, `cargo clippy --locked -- -D warnings`, and `cargo fmt --check` pass. `sum-cli` (37), `sum-cli-nary` (39), `sum-cli-help` (47), and `word-count` (28) replay byte-identically.
 
 **In flight:** nothing.
 

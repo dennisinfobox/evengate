@@ -22,6 +22,10 @@ const REVIEWER_SYSTEM_PROMPT: &str = "You are the review agent of the Evengate s
 You inspect a complete project against its task specification and return a strict JSON verdict. \
 You never edit files, never ask questions, and never wrap the result in prose.";
 
+const SINGLE_FILE_SYSTEM_PROMPT: &str = "You are a code editor. Return only the complete contents \
+of the requested file. Never return JSON, Markdown fences, or commentary. The response is written \
+verbatim to the file.";
+
 fn system_prompt(role: AgentRole) -> &'static str {
     match role {
         AgentRole::Reviewer => REVIEWER_SYSTEM_PROMPT,
@@ -29,17 +33,31 @@ fn system_prompt(role: AgentRole) -> &'static str {
     }
 }
 
-/// One request to a model. The prompt is the only recorded input; its hash is
-/// what `AgentInvoked` stores and what `RecordedClient` matches against.
+/// How the model must shape its answer. A single-file self-edit returns the
+/// file itself; everything else uses the JSON manifest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestFormat {
+    Default,
+    SingleFile,
+}
+
+/// One request to a model. The prompt and format are the recorded input; their
+/// hash is what `AgentInvoked` stores and what `RecordedClient` matches against.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LlmRequest {
     pub role: AgentRole,
     pub prompt: String,
+    pub format: RequestFormat,
 }
 
 impl LlmRequest {
     pub fn prompt_hash(&self) -> String {
-        format!("{:016x}", fnv1a64(self.prompt.as_bytes()))
+        let mut input = String::new();
+        if self.format == RequestFormat::SingleFile {
+            input.push_str("single-file\n");
+        }
+        input.push_str(&self.prompt);
+        format!("{:016x}", fnv1a64(input.as_bytes()))
     }
 }
 
@@ -313,12 +331,16 @@ impl LlmClient for LiveClient {
                 role.to_ascii_uppercase()
             )
         })?;
+        let system = match request.format {
+            RequestFormat::Default => system_prompt(request.role),
+            RequestFormat::SingleFile => SINGLE_FILE_SYSTEM_PROMPT,
+        };
         let body = ChatRequest {
             model,
             messages: vec![
                 ChatMessageIn {
                     role: "system",
-                    content: system_prompt(request.role),
+                    content: system,
                 },
                 ChatMessageIn {
                     role: "user",
@@ -538,6 +560,7 @@ mod tests {
         LlmRequest {
             role: AgentRole::Executor,
             prompt: prompt.to_string(),
+            format: RequestFormat::Default,
         }
     }
 
@@ -553,6 +576,16 @@ mod tests {
         assert_eq!(a.prompt_hash(), request("build hello").prompt_hash());
         assert_ne!(a.prompt_hash(), request("build other").prompt_hash());
         assert_eq!(a.prompt_hash().len(), 16);
+    }
+
+    #[test]
+    fn single_file_requests_hash_differently() {
+        let default = request("same");
+        let single = LlmRequest {
+            format: RequestFormat::SingleFile,
+            ..default.clone()
+        };
+        assert_ne!(default.prompt_hash(), single.prompt_hash());
     }
 
     #[test]
