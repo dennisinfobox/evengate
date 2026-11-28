@@ -188,6 +188,11 @@ pub fn reduce(mut state: State, event: &Event) -> State {
                 state.task_created = true;
             }
         }
+        Event::SelfEditBase { .. } => {
+            if !state.task_created {
+                anomaly(&mut state, "self_edit_base before task_created");
+            }
+        }
         Event::AgentInvoked { role, .. } => {
             if !state.task_created {
                 anomaly(&mut state, "agent_invoked before task_created");

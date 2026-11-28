@@ -1,6 +1,8 @@
-# Evengate — Technical Specification v0.17
+# Evengate — Technical Specification v0.18
 
 > A deterministic, Rust-native software factory that builds and improves itself under human oversight, and later produces pet projects in a familiar way.
+
+**Changes from v0.17:** self-edits are partial. `TaskCreated` is followed by `SelfEditBase`, a recorded repository tree; the executor sees only the target files plus a repository path map and returns only changed files; the review gate sees only files changed against the base; and the PR commits the base tree on `main` before the feature branch, so the human reviews a diff (§7.1, §7.4–§7.6, §10.2, ADR-0023, ADR-0024).
 
 **Changes from v0.16:** a spec can name `## Target` files; when one targets `src/`, the executor bases `project/` on a copy of this repository, refuses the offline template agent, and requires the complete tree. The sandbox image pre-fetches the locked dependency set so Evengate's own gates build offline (§7.4, §7.7, §8, §10.2, ADR-0021, ADR-0022).
 
@@ -169,7 +171,7 @@ tasks/<task-id>/
 
 **Replay guarantee:** `ev replay <task-id>` reads `events.jsonl`, folds through `reduce`, and produces a `State` identical to the live run when the snapshot was written by the same reducer. Live LLM responses are recorded as events, so replay never calls the network. The guarantee is about determinism, not backward compatibility: when the reducer changes, replaying an older log records the resulting anomaly and reports the snapshot mismatch instead of rewriting history. A gate-set change no longer reinterprets old tasks, because each `TaskCreated` records the gates in force at the time; logs that predate that field fold to `LEGACY_V0`. `tasks/hello` remains the pre-snapshot exception (§14, ADR-0015).
 
-**Execution replay:** `ev materialize <task-id>` reconstructs the gitignored `project/` tree and `lessons/<task-id>.md` from `AgentResponded` events in log order. The last executor manifest wins; the last usable reviewer verdict supplies the lesson. It calls no model, spawns nothing, and leaves `state.json` untouched, so the pure-fold guarantee of `ev replay` is unchanged. Only recorded files are recreated: a local `.git` or `target/` inside `project/` is dropped, and the bare remote under `artifacts/` is untouched.
+**Execution replay:** `ev materialize <task-id>` reconstructs the gitignored `project/` tree and `lessons/<task-id>.md` from `AgentResponded` events in log order. A generated project keeps the last executor manifest; a self-edit first writes its recorded `SelfEditBase` and then overlays every executor manifest, so the same log recreates the same tree without the live checkout. The last usable reviewer verdict supplies the lesson. It calls no model, spawns nothing, and leaves `state.json` untouched, so the pure-fold guarantee of `ev replay` is unchanged. Only recorded files are recreated: a local `.git` or `target/` inside `project/` is dropped, and the bare remote under `artifacts/` is untouched.
 
 **Formal contract:**
 
@@ -208,6 +210,7 @@ The loop is boring on purpose. All intelligence lives in `next_command` and in t
 ```rust
 pub enum Event {
     TaskCreated { spec: Spec, gates: Vec<GateId> },
+    SelfEditBase { files: BTreeMap<String, String> },
     AgentInvoked { role: AgentRole, prompt_hash: String },
     AgentResponded { role: AgentRole, response: String, tokens: TokenUsage },
     CommandExecuted { cmd: String, exit_code: i32, stdout: String, stderr: String },
@@ -281,7 +284,7 @@ The executor must never mutate `State` directly. It only returns events. A faili
 
 The same module owns `materialize`: it applies recorded executor manifests and reviewer lessons to disk in log order. It is the impure counterpart to `ev replay`, not part of the `Command` loop, and it never changes the log or the snapshot.
 
-**Self-edit tasks.** A spec whose `## Target` lists a path under `src/` is a self-improvement task (§10.2). On its first invocation the executor copies this repository into `project/`, excluding `.git`, `target`, `.tmp`, and the generated `tasks/*/project` and `tasks/*/artifacts` trees, and sends that tree to the executor. The prompt requires the complete tree back, because a manifest replaces `project/` wholesale; an omitted file is a deletion. The copy is the separate checkout the deterministic gates judge in the sandbox, so the live working tree is never mutated. The offline `TemplateClient` refuses a self-edit, because rendering `templates/bin` would replace Evengate with an unrelated crate.
+**Self-edit tasks.** A spec whose `## Target` lists a path under `src/` is a self-improvement task (§10.2). When `ev run` creates the task, it reads this repository — excluding `.git`, `target`, `.tmp`, and the generated `tasks/*/project` and `tasks/*/artifacts` trees — and records it as `SelfEditBase` immediately after `TaskCreated`. The base is therefore in the log before any model call, and `project/` is rebuilt from it rather than from the live checkout. The executor prompt carries the target files and a repository path map; the agent returns only the files it changed. The response overlays `project/`, so an unlisted file survives; deletions are not supported in v0. The copy is the separate checkout the deterministic gates judge in the sandbox, so the live working tree is never mutated. The offline `TemplateClient` refuses a self-edit, because rendering `templates/bin` would replace Evengate with an unrelated crate. When the PR opens, `main` is committed from `SelfEditBase` first, so the feature branch is a real diff.
 
 ### 7.5 `llm/` — the model boundary
 
@@ -298,7 +301,7 @@ pub struct RecordedClient { /* replays AgentResponded events by prompt hash */ }
 pub struct TemplateClient { /* offline: renders templates/ into a manifest */ }
 ```
 
-**Agent protocol.** A model response is one JSON object mapping relative paths to file contents:
+**Agent protocol.** A model response is one JSON object mapping relative paths to file contents. A generated project must return the complete tree; a self-edit returns only changed files because its manifest overlays the recorded base:
 
 ```json
 {"files": {"src/main.rs": "fn main() {}\n"}}
@@ -349,6 +352,8 @@ pub trait Gate {
 | `HumanApproval` | Human | Explicit `HumanApproved` event |
 
 **Rule:** the executing agent has no mechanism to mark a gate as passed. Gates own their verdicts.
+
+For a self-edit the review prompt carries the task spec, the repository path map, and only the files that differ from `SelfEditBase` (plus a deleted-file list); the reviewer judges the change, not a fresh copy of the repository.
 
 `Compiles`, `TestsPass`, `LintsClean`, `FormatClean`, and `ReviewAgent` are the mandatory v0 gates, in that order. `TaskCreated` records that list, so a later gate addition or removal never reinterprets an older task. The review agent runs on the artifact the deterministic gates accepted, records its request and raw response as `Reviewer` events, and maps a withheld approval to `Fail` with the issues as the reason. A rejection stops the run for a human immediately rather than re-asking the same tree; an unusable verdict becomes `NeedsHuman`. Review requires a model: with the offline `TemplateClient` the run stops at this gate with an actionable error and resumes once a model is configured. The executor cannot pass this gate on the reviewer's behalf. From a blocked state the human can `ev revise` (executor re-runs with the verdicts) or `ev abandon`; see §7.3. The verdict's `lessons` are written to `lessons/<task-id>.md` before the gate result is recorded; a revision overwrites the same file.
 
@@ -485,7 +490,7 @@ If `Goal`, `Acceptance`, or `Constraints` is missing, the spec is rejected at `T
 
 ### 10.2 What counts as self-improvement
 
-A task is a **self-improvement task** if its spec's `## Target` names a file under `src/` of Evengate. On first invocation `project/` is a copy of the repository, and the gates run on that copy in the sandbox. Evengate is allowed to modify itself under these rules:
+A task is a **self-improvement task** if its spec's `## Target` names a file under `src/` of Evengate. `ev run` records the repository tree as `SelfEditBase`, the executor sees only the target files plus a path map, and the gates run on the resulting copy in the sandbox. Evengate is allowed to modify itself under these rules:
 
 - The `HumanApproval` gate is mandatory and non-waivable for self-edits.
 - Evengate's own `Compiles` and `TestsPass` gates run on the modified Evengate **before** the PR is opened, using a separate checkout.

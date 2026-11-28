@@ -2,22 +2,21 @@
 
 Last updated: 2026-11-28
 
-**Phase:** Month 2 continues. The executor now has a self-edit path: a spec can mark `## Target` files, a target under `src/` seeds `project/` from a copy of this repository, and the sandbox image can build Evengate offline so its own gates run on that copy.
+**Phase:** Month 2 continues. The self-edit path is now usable with a local model: the repository base is recorded in the log, the executor sees only target files, responses overlay that base, the reviewer sees only the changed files, and the PR diff contains only the change.
 
 **Done since last handoff:**
-- `Spec` and `Context` carry an optional `target` list parsed from `## Target`. A target equal to `src` or under `src/` is a self-edit; empty targets serialize like a legacy spec, so `sum-cli` (37 events), `sum-cli-nary` (39), `sum-cli-help` (47), and `word-count` replay unchanged.
-- On its first invocation a self-edit finds the nearest ancestor with `.git`, `Cargo.toml`, and `src/`, copies the repository into `project/` (skipping `.git`, `target`, `.tmp`, and generated `tasks/*/project|artifacts`), and sends that tree to the executor. The live checkout is never touched; the gates judge the copy. Missing targets fail before the model call, and `TemplateClient` refuses self-edits so `templates/bin` cannot replace the repository.
-- The self-edit prompt requires the complete tree back. The manifest still replaces `project/`, so `ev materialize` reconstructs self-edits from the log without a base tree.
-- `sandbox/Dockerfile` now builds from the repository root and runs `cargo fetch --locked` at image-build time. With the rebuilt `evengate-sandbox:1.100`, `cargo check --locked`, `cargo test --locked`, `cargo clippy --locked -- -D warnings`, and `cargo fmt --check` all pass `--network=none` on a copy of this repository.
-- `validate_path` rejects `:` in manifest paths, so the Windows-drive test passes on Linux too. Without that, the artifact's own `TestsPass` gate would block every self-edit.
-- Verified end to end with a throwaway self-edit task and a mock OpenAI-compatible endpoint: the executor was seeded from a repository copy, all five gates passed on that copy, the review verdict was recorded, and `PrOpened` fired. The smoke task, lesson, and mock were deleted.
-- Checks: 102 tests per binary, `cargo check --locked`, `cargo clippy --locked -- -D warnings`, and `cargo fmt --check` pass. `sum-cli` (37), `sum-cli-nary` (39), `sum-cli-help` (47), and `word-count` (28) replay byte-identically.
+- `TaskCreated` is followed by `SelfEditBase`, the repository tree recorded before any model call (excluding `.git`, `target`, `.tmp`, and generated task trees). The task log is sufficient to rebuild `project/` and the PR base.
+- A self-edit executor prompt carries the `## Target` files and a repository path map, not the whole tree. The response manifest overlays `project/`; unlisted files survive. Deletions are not supported in v0. The offline `TemplateClient` still refuses self-edits.
+- The review prompt for a self-edit carries the task spec, the path map, and only the files that differ from `SelfEditBase`, plus a deleted-file list. A non-self-edit task still reviews the complete project.
+- `ev materialize` writes `SelfEditBase` first and then overlays every executor response, so execution replay needs no live checkout.
+- A self-edit PR commits `SelfEditBase` on `main` as `ev: initialize <project>` before the feature branch; `git diff main..ev/<project>` contains only the change. Generated projects keep the empty base commit.
+- Checks: 105 tests per binary, `cargo check --locked`, `cargo clippy --locked -- -D warnings`, and `cargo fmt --check` pass. `sum-cli` (37), `sum-cli-nary` (39), `sum-cli-help` (47), and `word-count` (28) replay byte-identically.
 
 **In flight:** nothing.
 
 **Next:**
-1. Run the first self-edit through the factory: write `tasks/<task-id>/spec.md` with a real Month 2 change and a `## Target` under `src/`, set `EVENGATE_LLM_URL`, run `ev run`, and review the PR that the gates produce.
-2. Decide whether a self-edit PR should carry a base commit so the human reviews a diff instead of the whole repository; the current PR base is still an empty commit.
+1. Run the first real self-edit through the factory: write `tasks/<task-id>/spec.md` with a small, testable change and a `## Target` under `src/`, point `EVENGATE_LLM_URL` at the local Ollama endpoint, run `ev run`, review the PR diff, and merge the reviewed change.
+2. After that run, decide whether a self-edit task should be able to delete a file; the current overlay protocol has no deletion field.
 
 **Blockers:** none.
 

@@ -75,51 +75,144 @@ impl ExecCtx {
         self.task_dir.join("project")
     }
 
-    /// Nearest ancestor that is the Evengate repository. A task directory
-    /// lives inside it, so a self-edit copy never depends on the caller's
-    /// working directory.
-    fn repo_root(&self) -> Result<PathBuf, String> {
-        for dir in self.task_dir.ancestors() {
-            if dir.join(".git").exists()
-                && dir.join("Cargo.toml").is_file()
-                && dir.join("src").is_dir()
-            {
-                return Ok(dir.to_path_buf());
-            }
-        }
-        Err(format!(
-            "self-edit task {} is not inside the Evengate repository",
-            self.task_dir.display()
-        ))
-    }
-
-    /// A self-edit starts from a copy of the repository, not from a template.
-    /// The copy is the separate checkout the gates judge; the live tree is
-    /// never touched.
+    /// A self-edit starts from the `SelfEditBase` recorded when the task was
+    /// created, not from a template and not from the live tree.
     fn seed_self_edit(&self) -> Result<(), String> {
         let project = self.project_dir();
         if project.exists() {
             return Ok(());
         }
-        let repo = self.repo_root()?;
-        copy_self_edit_tree(&repo, &project)?;
-        for target in &self.context.target {
-            let clean = target.trim().replace('\\', "/");
-            if !clean.is_empty() && !project.join(&clean).exists() {
-                return Err(format!(
-                    "self-edit target does not exist in the repository: {target}"
-                ));
-            }
-        }
+        let files = read_self_edit_base(&self.task_dir)?.ok_or_else(|| {
+            format!(
+                "self-edit task {} has no SelfEditBase event; recreate the task",
+                self.task_dir.display()
+            )
+        })?;
+        apply_manifest(&FileManifest { files }, &project, false)?;
         Ok(())
     }
 }
 
+/// Read the repository a self-edit starts from, excluding VCS metadata, build
+/// output, and generated task artifacts. The task directory must live inside
+/// the repository, so the caller's working directory never matters.
+pub fn self_edit_base(task_dir: &Path, spec: &Spec) -> Result<BTreeMap<String, String>, String> {
+    let repo = repo_root(task_dir)?;
+    let files = read_repository_files(&repo)?;
+    for target in &spec.target {
+        if !target_matches(&files, target) {
+            return Err(format!(
+                "self-edit target does not exist in the repository: {target}"
+            ));
+        }
+    }
+    Ok(files)
+}
+
+fn read_self_edit_base(task_dir: &Path) -> Result<Option<BTreeMap<String, String>>, String> {
+    let events =
+        crate::log::read_events(task_dir).map_err(|e| format!("cannot read the event log: {e}"))?;
+    Ok(events.into_iter().find_map(|event| match event {
+        Event::SelfEditBase { files } => Some(files),
+        _ => None,
+    }))
+}
+
+fn repo_root(task_dir: &Path) -> Result<PathBuf, String> {
+    for dir in task_dir.ancestors() {
+        if dir.join(".git").exists() && dir.join("Cargo.toml").is_file() && dir.join("src").is_dir()
+        {
+            return Ok(dir.to_path_buf());
+        }
+    }
+    Err(format!(
+        "self-edit task {} is not inside the Evengate repository",
+        task_dir.display()
+    ))
+}
+
+fn target_covers(target: &str, path: &str) -> bool {
+    let clean = target.trim().replace('\\', "/");
+    let clean = clean.trim_end_matches('/');
+    !clean.is_empty() && (path == clean || path.starts_with(&format!("{clean}/")))
+}
+
+fn target_covers_any(targets: &[String], path: &str) -> bool {
+    targets.is_empty() || targets.iter().any(|target| target_covers(target, path))
+}
+
+fn target_matches(files: &BTreeMap<String, String>, target: &str) -> bool {
+    files.keys().any(|path| target_covers(target, path))
+}
+
 const SELF_EDIT_SKIP_DIRS: [&str; 3] = [".git", "target", ".tmp"];
 
+fn skip_self_edit_entry(name: &str, rel: &Path) -> bool {
+    SELF_EDIT_SKIP_DIRS.contains(&name)
+        || (matches!(name, "project" | "artifacts")
+            && rel.starts_with("tasks")
+            && rel.components().count() == 2)
+}
+
+fn read_repository_files(root: &Path) -> Result<BTreeMap<String, String>, String> {
+    let mut files = BTreeMap::new();
+    let mut total = 0usize;
+    read_repository_entries(root, Path::new(""), &mut files, &mut total)?;
+    Ok(files)
+}
+
+fn read_repository_entries(
+    src: &Path,
+    rel: &Path,
+    files: &mut BTreeMap<String, String>,
+    total: &mut usize,
+) -> Result<(), String> {
+    let mut entries = fs::read_dir(src)
+        .map_err(|e| format!("cannot read {}: {e}", src.display()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("cannot read {}: {e}", src.display()))?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let file_name = entry.file_name();
+        let name = file_name.to_string_lossy();
+        if skip_self_edit_entry(&name, rel) {
+            continue;
+        }
+        let from = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|e| format!("cannot stat {}: {e}", from.display()))?;
+        if file_type.is_dir() {
+            read_repository_entries(&from, &rel.join(&file_name), files, total)?;
+        } else if file_type.is_file() {
+            let text = fs::read_to_string(&from).map_err(|e| {
+                format!(
+                    "self-edit base entry is not readable text: {}: {e}",
+                    from.display()
+                )
+            })?;
+            *total = total
+                .checked_add(text.len())
+                .ok_or("self-edit base size overflow")?;
+            if text.len() > llm::MAX_FILE_BYTES || *total > llm::MAX_TOTAL_BYTES {
+                return Err("self-edit base exceeds the manifest size limits".into());
+            }
+            files.insert(
+                rel.join(&file_name).to_string_lossy().replace('\\', "/"),
+                text,
+            );
+        } else {
+            return Err(format!(
+                "repository entry is not a file or directory: {}",
+                from.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Copy the repository without VCS metadata, build output, or generated task
-/// artifacts. The result is the self-edit working tree and the base for every
-/// gate sandbox.
+/// artifacts. Used to restore the edited tree after the base commit.
 fn copy_self_edit_tree(src: &Path, dst: &Path) -> Result<(), String> {
     copy_self_edit_entries(src, dst, Path::new(""))
 }
@@ -134,13 +227,7 @@ fn copy_self_edit_entries(src: &Path, dst: &Path, rel: &Path) -> Result<(), Stri
     for entry in entries {
         let file_name = entry.file_name();
         let name = file_name.to_string_lossy();
-        if SELF_EDIT_SKIP_DIRS.contains(&name.as_ref()) {
-            continue;
-        }
-        if matches!(name.as_ref(), "project" | "artifacts")
-            && rel.starts_with("tasks")
-            && rel.components().count() == 2
-        {
+        if skip_self_edit_entry(&name, rel) {
             continue;
         }
         let from = entry.path();
@@ -208,6 +295,16 @@ pub fn materialize(task_dir: &Path, lessons_dir: &Path) -> Result<MaterializeRep
         files: 0,
         lesson: false,
     };
+    if ctx.self_edit {
+        let files = events
+            .iter()
+            .find_map(|event| match event {
+                Event::SelfEditBase { files } => Some(files.clone()),
+                _ => None,
+            })
+            .ok_or("self-edit log has no SelfEditBase event")?;
+        report.files += apply_manifest(&FileManifest { files }, &ctx.project_dir(), false)?;
+    }
     for event in &events {
         if let Event::AgentResponded {
             role: AgentRole::Executor,
@@ -216,7 +313,7 @@ pub fn materialize(task_dir: &Path, lessons_dir: &Path) -> Result<MaterializeRep
         } = event
         {
             let manifest = FileManifest::parse(response)?;
-            report.files += apply_manifest(&manifest, &ctx.project_dir())?;
+            report.files += apply_manifest(&manifest, &ctx.project_dir(), ctx.self_edit)?;
             report.responses += 1;
         }
     }
@@ -299,13 +396,19 @@ fn invoke_agent(role: AgentRole, context: &Context, ctx: &ExecCtx) -> Result<Vec
     let client = client_for(ctx, role)?;
     let lessons = knowledge::recent_lessons(&ctx.lessons_dir, knowledge::RECENT_LESSONS)?;
     let rules = knowledge::read_rules(&ctx.rules_dir, &ctx.project_name)?;
-    let current = if !context.feedback.is_empty() {
-        Some(read_project_files(&ctx.project_dir())?)
-    } else if ctx.self_edit {
+    let (current, repository_files) = if ctx.self_edit {
         ctx.seed_self_edit()?;
-        Some(read_project_files(&ctx.project_dir())?)
+        let all = read_project_files(&ctx.project_dir())?;
+        let selected = all
+            .iter()
+            .filter(|(path, _)| target_covers_any(&context.target, path))
+            .map(|(path, content)| (path.clone(), content.clone()))
+            .collect();
+        (Some(selected), all.keys().cloned().collect())
+    } else if !context.feedback.is_empty() {
+        (Some(read_project_files(&ctx.project_dir())?), Vec::new())
     } else {
-        None
+        (None, Vec::new())
     };
     let prompt = build_prompt(
         context,
@@ -313,11 +416,12 @@ fn invoke_agent(role: AgentRole, context: &Context, ctx: &ExecCtx) -> Result<Vec
         &lessons,
         rules.as_deref(),
         current.as_ref(),
+        &repository_files,
     )?;
     let request = LlmRequest { role, prompt };
     let response = client.complete(&request)?;
     let manifest = FileManifest::parse(&response.text)?;
-    apply_manifest(&manifest, &ctx.project_dir())?;
+    apply_manifest(&manifest, &ctx.project_dir(), ctx.self_edit)?;
     Ok(vec![
         Event::AgentInvoked {
             role,
@@ -339,6 +443,7 @@ fn build_prompt(
     lessons: &[Lesson],
     rules: Option<&str>,
     current: Option<&BTreeMap<String, String>>,
+    repository_files: &[String],
 ) -> Result<String, String> {
     let self_edit = context.target.iter().any(|path| spec::targets_self(path));
     let mut prompt = String::new();
@@ -360,10 +465,17 @@ fn build_prompt(
     push_list(&mut prompt, "Revision feedback", &context.feedback);
     prompt.push_str(&knowledge::prompt_section(lessons));
 
+    if self_edit && !repository_files.is_empty() {
+        prompt.push_str("\n# Repository files\n");
+        for path in repository_files {
+            let _ = writeln!(prompt, "- {path}");
+        }
+    }
+
     if let Some(files) = current {
         if self_edit {
             prompt.push_str(
-                "\n# Current project\nThis is a copy of the Evengate repository. Apply the task to these files and keep the rest unchanged.\n",
+                "\n# Files to edit\nThese are the files named under Target. Return their new contents, or no file when no change is needed.\n",
             );
         } else {
             prompt.push_str(
@@ -392,7 +504,7 @@ fn build_prompt(
     );
     if self_edit {
         prompt.push_str(
-            "Return the complete repository tree, not only the changed files: any file you omit is deleted from the project.\n",
+            "Return only the files you changed. Every unlisted path stays as it is; this task cannot delete files.\n",
         );
     }
     Ok(prompt)
@@ -405,17 +517,48 @@ fn build_review_prompt(
     project: &Path,
     rules: Option<&str>,
     lessons: &[Lesson],
+    base: Option<&BTreeMap<String, String>>,
 ) -> Result<String, String> {
-    let mut prompt = String::from(
-        "Review the complete project below before it is offered to the human owner.\n",
-    );
+    let files = read_project_files(project)?;
+    let mut prompt = if base.is_some() {
+        String::from("Review the change below before it is offered to the human owner.\n")
+    } else {
+        String::from("Review the complete project below before it is offered to the human owner.\n")
+    };
     push_task_spec(&mut prompt, context);
     prompt.push_str(&knowledge::rules_section(rules));
     prompt.push_str(&knowledge::prompt_section(lessons));
-    let files = read_project_files(project)?;
-    prompt.push_str("\n# Project files\n");
-    for (path, content) in files {
-        let _ = writeln!(prompt, "\n--- {path} ---\n{content}");
+    if let Some(base) = base {
+        prompt.push_str("\n# Repository files\n");
+        for path in files.keys() {
+            let _ = writeln!(prompt, "- {path}");
+        }
+        let changed: Vec<(&String, &String)> = files
+            .iter()
+            .filter(|(path, content)| base.get(*path) != Some(*content))
+            .collect();
+        prompt.push_str("\n# Changed files\n");
+        if changed.is_empty() {
+            prompt.push_str("(none)\n");
+        }
+        for (path, content) in changed {
+            let _ = writeln!(prompt, "\n--- {path} ---\n{content}");
+        }
+        let deleted: Vec<&String> = base
+            .keys()
+            .filter(|path| !files.contains_key(*path))
+            .collect();
+        if !deleted.is_empty() {
+            prompt.push_str("\n# Deleted files\n");
+            for path in deleted {
+                let _ = writeln!(prompt, "- {path}");
+            }
+        }
+    } else {
+        prompt.push_str("\n# Project files\n");
+        for (path, content) in &files {
+            let _ = writeln!(prompt, "\n--- {path} ---\n{content}");
+        }
     }
     prompt.push_str(
         "\n# Output\nReturn one JSON object and nothing else:\n\
@@ -504,11 +647,12 @@ fn push_list(prompt: &mut String, title: &str, items: &[String]) {
     }
 }
 
-/// Replace `project/` with the files the agent returned. Validation happens
-/// before the old tree is removed, so a bad manifest cannot destroy work.
-fn apply_manifest(manifest: &FileManifest, dst: &Path) -> Result<usize, String> {
+/// Write a manifest into `project/`. A generated project is replaced
+/// wholesale; a self-edit overlays, so unlisted files survive. Validation
+/// happens first, so a bad manifest cannot destroy work.
+fn apply_manifest(manifest: &FileManifest, dst: &Path, overlay: bool) -> Result<usize, String> {
     manifest.validate()?;
-    if dst.exists() {
+    if !overlay && dst.exists() {
         fs::remove_dir_all(dst).map_err(|e| format!("cannot clear {}: {e}", dst.display()))?;
     }
     fs::create_dir_all(dst).map_err(|e| format!("cannot create {}: {e}", dst.display()))?;
@@ -568,7 +712,18 @@ fn run_gate(gate_id: GateId, ctx: &ExecCtx) -> Result<Vec<Event>, String> {
 fn run_review_gate(ctx: &ExecCtx) -> Result<Vec<Event>, String> {
     let rules = knowledge::read_rules(&ctx.rules_dir, &ctx.project_name)?;
     let lessons = knowledge::recent_lessons(&ctx.lessons_dir, knowledge::RECENT_LESSONS)?;
-    let prompt = build_review_prompt(&ctx.context, &ctx.project_dir(), rules.as_deref(), &lessons)?;
+    let base = if ctx.self_edit {
+        read_self_edit_base(&ctx.task_dir)?
+    } else {
+        None
+    };
+    let prompt = build_review_prompt(
+        &ctx.context,
+        &ctx.project_dir(),
+        rules.as_deref(),
+        &lessons,
+        base.as_ref(),
+    )?;
     let request = LlmRequest {
         role: AgentRole::Reviewer,
         prompt,
@@ -639,6 +794,79 @@ fn repetition_events(
         .collect())
 }
 
+/// Build `main` from the recorded base tree, then restore the edited tree for
+/// the feature branch. The human sees a diff, not a repository-sized addition.
+fn prepare_self_edit_base(
+    events: &mut Vec<Event>,
+    ctx: &ExecCtx,
+    project: &Path,
+) -> Result<(), String> {
+    let files = read_self_edit_base(&ctx.task_dir)?
+        .ok_or("self-edit log has no SelfEditBase event; recreate the task")?;
+    let stash = ctx.task_dir.join("artifacts").join("self-edit-edited");
+    if stash.exists() {
+        fs::remove_dir_all(&stash).map_err(|e| format!("cannot clear {}: {e}", stash.display()))?;
+    }
+    if let Some(parent) = stash.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+    }
+    fs::rename(project, &stash).map_err(|e| {
+        format!(
+            "cannot move {} aside to {}: {e}",
+            project.display(),
+            stash.display()
+        )
+    })?;
+
+    apply_manifest(&FileManifest { files }, project, false)?;
+    git_step(events, project, &["init", "-q", "-b", "main"])?;
+    git_step(events, project, &["add", "-A"])?;
+    let base = format!("ev: initialize {}", ctx.project_name);
+    git_step(
+        events,
+        project,
+        &[
+            "-c",
+            &format!("user.name={COMMIT_NAME}"),
+            "-c",
+            &format!("user.email={COMMIT_EMAIL}"),
+            "commit",
+            "-q",
+            "-m",
+            &base,
+        ],
+    )?;
+
+    clear_worktree(project)?;
+    copy_self_edit_tree(&stash, project)?;
+    fs::remove_dir_all(&stash).map_err(|e| format!("cannot remove {}: {e}", stash.display()))?;
+    Ok(())
+}
+
+fn clear_worktree(project: &Path) -> Result<(), String> {
+    let entries = fs::read_dir(project)
+        .map_err(|e| format!("cannot read {}: {e}", project.display()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("cannot read {}: {e}", project.display()))?;
+    for entry in entries {
+        if entry.file_name() == ".git" {
+            continue;
+        }
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|e| format!("cannot stat {}: {e}", path.display()))?;
+        let result = if file_type.is_dir() {
+            fs::remove_dir_all(&path)
+        } else {
+            fs::remove_file(&path)
+        };
+        result.map_err(|e| format!("cannot remove {}: {e}", path.display()))?;
+    }
+    Ok(())
+}
+
 fn open_pull_request(branch: &str, ctx: &ExecCtx) -> Result<Vec<Event>, String> {
     let project = ctx.project_dir();
     if !project.is_dir() {
@@ -646,11 +874,16 @@ fn open_pull_request(branch: &str, ctx: &ExecCtx) -> Result<Vec<Event>, String> 
     }
     let mut events = Vec::new();
     if !project.join(".git").exists() {
-        git_step(&mut events, &project, &["init", "-q", "-b", "main"])?;
+        if ctx.self_edit {
+            prepare_self_edit_base(&mut events, ctx, &project)?;
+        } else {
+            git_step(&mut events, &project, &["init", "-q", "-b", "main"])?;
+        }
     }
 
-    // A pull request needs a base commit on `main`. The first run creates an
-    // empty one; the generated files belong to the feature branch only.
+    // A pull request needs a base commit on `main`. A generated project gets an
+    // empty one; a self-edit gets the pristine base tree, so the branch diff
+    // contains only the change.
     let head = git_attempt(
         &mut events,
         &project,
@@ -815,7 +1048,7 @@ mod tests {
             open_questions: Vec::new(),
             feedback: Vec::new(),
         };
-        let prompt = build_prompt(&context, &template, &[], None, None).unwrap();
+        let prompt = build_prompt(&context, &template, &[], None, None, &[]).unwrap();
         assert!(prompt.contains("make a crate"));
         assert!(prompt.contains("- it compiles"));
         assert!(prompt.contains("- no crates"));
@@ -825,14 +1058,14 @@ mod tests {
         assert!(!prompt.contains("{{crate_name}}"));
         assert_eq!(
             prompt,
-            build_prompt(&context, &template, &[], None, None).unwrap()
+            build_prompt(&context, &template, &[], None, None, &[]).unwrap()
         );
 
         fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
-    fn self_edit_seeds_project_from_the_repository() {
+    fn self_edit_base_records_the_repository_without_generated_trees() {
         let root = env::temp_dir().join(format!("evengate-self-edit-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         for dir in [
@@ -857,10 +1090,28 @@ mod tests {
             target: vec!["src/main.rs".into()],
             ..Spec::default()
         };
-        let ctx = ExecCtx::new(&root.join("tasks/self-edit"), &spec);
-        ctx.seed_self_edit().unwrap();
+        let task = root.join("tasks/self-edit");
+        let base = self_edit_base(&task, &spec).unwrap();
+        assert_eq!(base.get("src/main.rs").unwrap(), "fn main() {}\n");
+        assert!(base.contains_key("Cargo.toml"));
+        assert!(!base.contains_key("target/debug/junk"));
+        assert!(!base.contains_key("tasks/keep/artifacts/junk"));
+        assert!(!base.contains_key("tasks/keep/project/junk"));
+        assert!(base.contains_key("tasks/keep/events.jsonl"));
 
-        let project = root.join("tasks/self-edit/project");
+        log::append_event(
+            &task,
+            &Event::TaskCreated {
+                spec: spec.clone(),
+                gates: gate::MANDATORY_V0.to_vec(),
+            },
+        )
+        .unwrap();
+        log::append_event(&task, &Event::SelfEditBase { files: base }).unwrap();
+
+        let ctx = ExecCtx::new(&task, &spec);
+        ctx.seed_self_edit().unwrap();
+        let project = task.join("project");
         assert_eq!(
             fs::read_to_string(project.join("src/main.rs")).unwrap(),
             "fn main() {}\n"
@@ -868,9 +1119,6 @@ mod tests {
         assert!(project.join("Cargo.toml").is_file());
         assert!(!project.join(".git").exists());
         assert!(!project.join("target").exists());
-        assert!(!project.join("tasks/keep/artifacts").exists());
-        assert!(!project.join("tasks/keep/project").exists());
-        assert!(project.join("tasks/keep/events.jsonl").is_file());
 
         fs::remove_dir_all(&root).unwrap();
     }
@@ -890,15 +1138,14 @@ mod tests {
             target: vec!["src/no-such.rs".into()],
             ..Spec::default()
         };
-        let ctx = ExecCtx::new(&root.join("tasks/self-edit"), &spec);
-        let error = ctx.seed_self_edit().unwrap_err();
+        let error = self_edit_base(&root.join("tasks/self-edit"), &spec).unwrap_err();
         assert!(error.contains("self-edit target does not exist"), "{error}");
 
         fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
-    fn self_edit_prompt_uses_the_current_tree_and_requires_every_file() {
+    fn self_edit_prompt_is_scoped_to_target_files() {
         let context = Context {
             project: "edit-the-gate".into(),
             title: "Edit the gate".into(),
@@ -913,6 +1160,7 @@ mod tests {
         };
         let mut current = BTreeMap::new();
         current.insert("src/gate.rs".to_string(), "fn gate() {}\n".to_string());
+        let repository = vec!["Cargo.toml".to_string(), "src/gate.rs".to_string()];
 
         let prompt = build_prompt(
             &context,
@@ -920,13 +1168,18 @@ mod tests {
             &[],
             None,
             Some(&current),
+            &repository,
         )
         .unwrap();
         assert!(prompt.starts_with("Edit the existing Evengate project"));
         assert!(prompt.contains("## Target\n- src/gate.rs"));
-        assert!(prompt.contains("# Current project"));
-        assert!(prompt.contains("copy of the Evengate repository"));
-        assert!(prompt.contains("complete repository tree, not only the changed files"));
+        assert!(prompt.contains("# Repository files\n- Cargo.toml\n- src/gate.rs"));
+        assert!(prompt.contains("# Files to edit"));
+        assert!(prompt.contains("--- src/gate.rs ---\nfn gate() {}"));
+        assert!(prompt.contains("Return only the files you changed"));
+        assert!(prompt.contains("cannot delete files"));
+        assert!(!prompt.contains("# Current project"));
+        assert!(!prompt.contains("complete repository tree"));
         assert!(!prompt.contains("# Reference template"));
     }
 
@@ -946,8 +1199,15 @@ mod tests {
             },
         );
         let context = Context::from_revision(&spec, &failures, Some("keep it small"));
-        let prompt =
-            build_prompt(&context, Path::new("no-such-template-dir"), &[], None, None).unwrap();
+        let prompt = build_prompt(
+            &context,
+            Path::new("no-such-template-dir"),
+            &[],
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
         assert!(prompt.starts_with("Revise the existing project"));
         assert!(prompt.contains("## Revision feedback"));
         assert!(prompt.contains("- cargo check failed: boom"));
@@ -973,6 +1233,7 @@ mod tests {
             &lessons,
             None,
             None,
+            &[],
         )
         .unwrap();
         assert!(prompt.contains("# Lessons from previous tasks"));
@@ -999,6 +1260,7 @@ mod tests {
             &lessons,
             Some("No unsafe code.\nNo network."),
             None,
+            &[],
         )
         .unwrap();
         assert!(prompt.contains("# Project rules\n"));
@@ -1014,6 +1276,7 @@ mod tests {
                 &lessons,
                 Some("No unsafe code.\nNo network."),
                 None,
+                &[],
             )
             .unwrap()
         );
@@ -1046,6 +1309,7 @@ mod tests {
             &[],
             None,
             Some(&current),
+            &[],
         )
         .unwrap();
         assert!(prompt.contains("# Current project"));
@@ -1067,7 +1331,7 @@ mod tests {
         files.insert("src/main.rs".to_string(), "fn main() {}\n".to_string());
         let manifest = FileManifest { files };
 
-        assert_eq!(apply_manifest(&manifest, &project).unwrap(), 2);
+        assert_eq!(apply_manifest(&manifest, &project, false).unwrap(), 2);
         assert!(!project.join("old").exists());
         assert_eq!(
             fs::read_to_string(project.join("src/main.rs")).unwrap(),
@@ -1087,7 +1351,7 @@ mod tests {
 
         let mut files = BTreeMap::new();
         files.insert("../escape.txt".to_string(), "x".to_string());
-        assert!(apply_manifest(&FileManifest { files }, &project).is_err());
+        assert!(apply_manifest(&FileManifest { files }, &project, false).is_err());
         assert!(project.join("keep.txt").exists());
         assert!(!root.join("escape.txt").exists());
 
@@ -1124,7 +1388,7 @@ mod tests {
             name: "sum-cli".into(),
             body: "# Lessons — Sum CLI\n\n- Keep the usage message clear.".into(),
         }];
-        let prompt = build_review_prompt(&context, &project, rules, &lessons).unwrap();
+        let prompt = build_review_prompt(&context, &project, rules, &lessons, None).unwrap();
         assert!(prompt.contains("--- src/main.rs ---\nfn main() {}"));
         assert!(prompt.contains("--- Cargo.toml ---"));
         assert!(!prompt.contains(".git/HEAD"));
@@ -1142,8 +1406,39 @@ mod tests {
         assert!(prompt.contains("\"approve\""));
         assert_eq!(
             prompt,
-            build_review_prompt(&context, &project, rules, &lessons).unwrap()
+            build_review_prompt(&context, &project, rules, &lessons, None).unwrap()
         );
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn self_edit_review_prompt_carries_only_changed_files() {
+        let root = env::temp_dir().join(format!("evengate-review-edit-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let project = root.join("project");
+        fs::create_dir_all(project.join("src")).unwrap();
+        fs::write(project.join("src/main.rs"), "fn main() { changed }\n").unwrap();
+        fs::write(project.join("src/other.rs"), "fn other() {}\n").unwrap();
+
+        let mut base = BTreeMap::new();
+        base.insert("src/main.rs".to_string(), "fn main() {}\n".to_string());
+        base.insert("src/other.rs".to_string(), "fn other() {}\n".to_string());
+        let mut context = Context::from_spec(&Spec {
+            title: "Edit".into(),
+            goal: "g".into(),
+            target: vec!["src/main.rs".into()],
+            ..Spec::default()
+        });
+        context.feedback.clear();
+
+        let prompt = build_review_prompt(&context, &project, None, &[], Some(&base)).unwrap();
+        assert!(prompt.starts_with("Review the change below"));
+        assert!(prompt.contains("# Changed files"));
+        assert!(prompt.contains("--- src/main.rs ---\nfn main() { changed }"));
+        assert!(!prompt.contains("--- src/other.rs ---"));
+        assert!(prompt.contains("- src/other.rs"));
+        assert!(!prompt.contains("fn main() {}\n"));
 
         fs::remove_dir_all(&root).unwrap();
     }
@@ -1210,6 +1505,72 @@ mod tests {
         assert!(!task.join("project/old").exists());
         let lesson = fs::read_to_string(lessons.join("word-count.md")).unwrap();
         assert!(lesson.contains("- import what the tests use"));
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn materialize_applies_self_edit_responses_over_the_base() {
+        let root = materialize_dir("self-edit");
+        let task = root.join("self-edit");
+        let lessons = root.join("lessons");
+        log::append_event(
+            &task,
+            &Event::TaskCreated {
+                spec: Spec {
+                    title: "Self Edit".into(),
+                    goal: "g".into(),
+                    target: vec!["src/main.rs".into()],
+                    ..Spec::default()
+                },
+                gates: gate::MANDATORY_V0.to_vec(),
+            },
+        )
+        .unwrap();
+        let mut base = BTreeMap::new();
+        base.insert("src/main.rs".to_string(), "fn main() {}\n".to_string());
+        base.insert("src/keep.rs".to_string(), "fn keep() {}\n".to_string());
+        log::append_event(&task, &Event::SelfEditBase { files: base }).unwrap();
+        log::append_event(
+            &task,
+            &Event::AgentResponded {
+                role: AgentRole::Executor,
+                response: r#"{"files":{"src/main.rs":"fn main() { changed }\n"}}"#.into(),
+                tokens: Default::default(),
+            },
+        )
+        .unwrap();
+        log::append_event(
+            &task,
+            &Event::AgentResponded {
+                role: AgentRole::Reviewer,
+                response: r#"{"approve":true,"issues":[],"lessons":["keep the diff small"]}"#
+                    .into(),
+                tokens: Default::default(),
+            },
+        )
+        .unwrap();
+        fs::create_dir_all(task.join("project")).unwrap();
+        fs::write(task.join("project/stale.txt"), "stale").unwrap();
+
+        let report = materialize(&task, &lessons).unwrap();
+        assert_eq!(
+            report,
+            MaterializeReport {
+                responses: 1,
+                files: 3,
+                lesson: true
+            }
+        );
+        assert_eq!(
+            fs::read_to_string(task.join("project/src/main.rs")).unwrap(),
+            "fn main() { changed }\n"
+        );
+        assert_eq!(
+            fs::read_to_string(task.join("project/src/keep.rs")).unwrap(),
+            "fn keep() {}\n"
+        );
+        assert!(!task.join("project/stale.txt").exists());
 
         fs::remove_dir_all(&root).unwrap();
     }
@@ -1371,6 +1732,63 @@ mod tests {
         assert!(repetition_events(&lessons, &rules, "hello")
             .unwrap()
             .is_empty());
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn self_edit_pr_commits_the_base_before_the_change() {
+        let root = materialize_dir("self-edit-pr");
+        let task = root.join("self-edit");
+        let spec = Spec {
+            title: "Test Edit".into(),
+            goal: "g".into(),
+            target: vec!["src/main.rs".into()],
+            ..Spec::default()
+        };
+        log::append_event(
+            &task,
+            &Event::TaskCreated {
+                spec: spec.clone(),
+                gates: gate::MANDATORY_V0.to_vec(),
+            },
+        )
+        .unwrap();
+        let mut base = BTreeMap::new();
+        base.insert("src/main.rs".to_string(), "fn main() {}\n".to_string());
+        base.insert("src/keep.rs".to_string(), "fn keep() {}\n".to_string());
+        log::append_event(&task, &Event::SelfEditBase { files: base }).unwrap();
+
+        let project = task.join("project");
+        fs::create_dir_all(project.join("src")).unwrap();
+        fs::write(project.join("src/main.rs"), "fn main() { changed }\n").unwrap();
+        fs::write(project.join("src/keep.rs"), "fn keep() {}\n").unwrap();
+
+        let ctx = ExecCtx::new(&task, &spec);
+        let events = open_pull_request("ev/test", &ctx).unwrap();
+        assert!(matches!(events.last(), Some(Event::PrOpened { .. })));
+
+        let log = Process::new("git")
+            .current_dir(&project)
+            .args(["log", "--format=%s", "--reverse"])
+            .output()
+            .unwrap();
+        assert!(log.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&log.stdout).trim(),
+            "ev: initialize test-edit\nev: Test Edit"
+        );
+
+        let diff = Process::new("git")
+            .current_dir(&project)
+            .args(["diff", "--name-status", "main", "ev/test"])
+            .output()
+            .unwrap();
+        assert!(diff.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&diff.stdout).trim(),
+            "M\tsrc/main.rs"
+        );
 
         fs::remove_dir_all(&root).unwrap();
     }

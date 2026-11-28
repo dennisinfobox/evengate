@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::spec::Spec;
@@ -16,6 +18,11 @@ pub enum Event {
         /// historical gate set so replay never reinterprets a past task.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         gates: Vec<GateId>,
+    },
+    /// The repository tree a self-edit started from, recorded before the first
+    /// model call so materialization never needs the live checkout.
+    SelfEditBase {
+        files: BTreeMap<String, String>,
     },
     AgentInvoked {
         role: AgentRole,

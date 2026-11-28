@@ -80,12 +80,22 @@ fn run_task(args: &[String]) -> Result<(), String> {
     let mut events = log::read_events(&task_dir)
         .map_err(|e| format!("cannot read {}: {e}", log::events_path(&task_dir).display()))?;
     if events.is_empty() {
+        let base = if spec.is_self_edit() {
+            Some(executor::self_edit_base(&task_dir, &spec)?)
+        } else {
+            None
+        };
         let created = Event::TaskCreated {
             spec,
             gates: gate::MANDATORY_V0.to_vec(),
         };
         log::append_event(&task_dir, &created).map_err(|e| format!("cannot append event: {e}"))?;
         events.push(created);
+        if let Some(files) = base {
+            let base = Event::SelfEditBase { files };
+            log::append_event(&task_dir, &base).map_err(|e| format!("cannot append event: {e}"))?;
+            events.push(base);
+        }
     }
     let state = fold(&events);
     log::write_state(&task_dir, &state).map_err(|e| format!("cannot write state: {e}"))?;
