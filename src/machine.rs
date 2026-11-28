@@ -11,6 +11,10 @@ use crate::state::{self, ArtifactRef, HumanDecision, Phase, RepeatedLesson, Stat
 /// Retries allowed per deterministic gate before the machine asks for a human.
 pub const MAX_GATE_ATTEMPTS: u32 = 2;
 
+/// Agent invocations allowed while a task stays in one phase. A malformed log
+/// or a future phase that forgets to advance stops here instead of looping.
+pub const MAX_AGENT_INVOCATIONS_PER_PHASE: u32 = 5;
+
 /// Human-requested revisions allowed per task. Each revision re-invokes the
 /// executor with the gate failures and resets the per-gate attempt counters.
 pub const MAX_REVISIONS: u32 = 2;
@@ -64,12 +68,11 @@ fn revision_feedback(
     let mut lines: Vec<String> = failures
         .iter()
         .filter_map(|(gate, result)| match result {
-            GateResult::Fail { reason } => {
-                Some(format!("{} failed: {reason}", gate::label(*gate)))
-            }
-            GateResult::NeedsHuman { question } => {
-                Some(format!("{} needs attention: {question}", gate::label(*gate)))
-            }
+            GateResult::Fail { reason } => Some(format!("{} failed: {reason}", gate::label(*gate))),
+            GateResult::NeedsHuman { question } => Some(format!(
+                "{} needs attention: {question}",
+                gate::label(*gate)
+            )),
             GateResult::Pass => None,
         })
         .collect();
@@ -100,7 +103,10 @@ pub enum Command {
 impl Command {
     /// Commands that intentionally produce no events and end the current run.
     pub fn is_awaiting(&self) -> bool {
-        matches!(self, Command::AwaitHuman | Command::RequestHumanReview { .. })
+        matches!(
+            self,
+            Command::AwaitHuman | Command::RequestHumanReview { .. }
+        )
     }
 }
 
@@ -113,6 +119,13 @@ pub fn branch_name(spec: &Spec) -> String {
 /// bounded by `MAX_GATE_ATTEMPTS`; there is no path that repeats a command
 /// forever.
 pub fn next_command(state: &State) -> Option<Command> {
+    // Loop protection: every branch below keys off a verdict or a counter
+    // that only an intervening event can change, so no command repeats on an
+    // unchanged state. This budget is the backstop if a phase ever stops
+    // advancing; gate retries and revisions have their own caps.
+    if state.phase_invocations >= MAX_AGENT_INVOCATIONS_PER_PHASE {
+        return Some(review_command());
+    }
     match state.phase {
         Phase::Drafting => {
             if state.agent_invocations == 0 {
@@ -144,7 +157,7 @@ pub fn next_command(state: &State) -> Option<Command> {
             }
         }
         Phase::Verifying => {
-            for gate_id in gate::MANDATORY_V0 {
+            for gate_id in state.gate_set().iter().copied() {
                 match state.gate_results.get(&gate_id) {
                     Some(GateResult::Pass) => continue,
                     Some(GateResult::NeedsHuman { .. }) => return Some(review_command()),
@@ -153,9 +166,7 @@ pub fn next_command(state: &State) -> Option<Command> {
                         // A review failure is a verdict about the artifact, not
                         // a flaky check; re-asking the same tree only burns
                         // tokens. Stop for a human on the first rejection.
-                        return if gate_id == GateId::ReviewAgent
-                            || attempts >= MAX_GATE_ATTEMPTS
-                        {
+                        return if gate_id == GateId::ReviewAgent || attempts >= MAX_GATE_ATTEMPTS {
                             Some(review_command())
                         } else {
                             Some(Command::RunGate { gate: gate_id })
@@ -173,15 +184,20 @@ pub fn next_command(state: &State) -> Option<Command> {
         }
         Phase::Reviewing => match &state.human_decision {
             None => Some(Command::AwaitHuman),
-            Some(HumanDecision::Approved { .. }) => {
-                if state::all_mandatory_passed(state) {
-                    Some(Command::Finalize {
-                        outcome: Outcome::Merged,
-                    })
-                } else {
+            Some(HumanDecision::Approved { reason, .. }) => {
+                if !state::all_mandatory_passed(state) {
                     // Approval cannot bypass gates.
-                    Some(review_command())
+                    return Some(review_command());
                 }
+                // Gate immutability: a task created under a different gate
+                // set may merge only through an explicit, recorded reason.
+                // A bare approval never silently reconciles the two sets.
+                if gate_set_differs(state) && reason.is_none() {
+                    return Some(review_command());
+                }
+                Some(Command::Finalize {
+                    outcome: Outcome::Merged,
+                })
             }
             Some(HumanDecision::Rejected { .. }) => Some(Command::Finalize {
                 outcome: Outcome::Rejected,
@@ -189,6 +205,13 @@ pub fn next_command(state: &State) -> Option<Command> {
         },
         Phase::Merged | Phase::Abandoned => None,
     }
+}
+
+/// True when the task was judged by a different mandatory set than the
+/// running binary. Merging such a task requires an explicit human reason;
+/// this is the gate-immutability override path.
+pub fn gate_set_differs(state: &State) -> bool {
+    state.gate_set() != gate::MANDATORY_V0
 }
 
 /// Repeated lessons the human has not promoted or dismissed in this task.
@@ -245,7 +268,13 @@ mod tests {
     }
 
     fn generated() -> State {
-        let state = reduce(initial(), &Event::TaskCreated { spec: spec() });
+        let state = reduce(
+            initial(),
+            &Event::TaskCreated {
+                spec: spec(),
+                gates: gate::MANDATORY_V0.to_vec(),
+            },
+        );
         let state = reduce(
             state,
             &Event::AgentInvoked {
@@ -277,7 +306,12 @@ mod tests {
     }
 
     fn with_deterministic_passes(mut state: State) -> State {
-        for id in [GateId::Compiles, GateId::TestsPass, GateId::LintsClean] {
+        for id in [
+            GateId::Compiles,
+            GateId::TestsPass,
+            GateId::LintsClean,
+            GateId::FormatClean,
+        ] {
             state = reduce(
                 state,
                 &Event::GateEvaluated {
@@ -296,6 +330,87 @@ mod tests {
             next_command(&state),
             Some(Command::RunGate {
                 gate: GateId::ReviewAgent
+            })
+        );
+    }
+
+    #[test]
+    fn format_runs_before_the_review() {
+        let state = generated();
+        let state = [GateId::Compiles, GateId::TestsPass, GateId::LintsClean]
+            .into_iter()
+            .fold(state, |state, id| {
+                reduce(
+                    state,
+                    &Event::GateEvaluated {
+                        gate: id,
+                        result: GateResult::Pass,
+                    },
+                )
+            });
+        assert_eq!(
+            next_command(&state),
+            Some(Command::RunGate {
+                gate: GateId::FormatClean
+            })
+        );
+    }
+
+    #[test]
+    fn a_phase_budget_stops_an_endless_loop() {
+        let mut state = reduce(
+            blocked(),
+            &Event::RevisionRequested {
+                reviewer: "d".into(),
+                guidance: None,
+            },
+        );
+        state.phase_invocations = MAX_AGENT_INVOCATIONS_PER_PHASE;
+        assert!(matches!(
+            next_command(&state),
+            Some(Command::RequestHumanReview { .. })
+        ));
+    }
+
+    fn reviewing_under(gates: Vec<GateId>) -> State {
+        let mut state = with_passes(generated());
+        state.gates = gates;
+        let state = reduce(state, &Event::PrOpened { url: "u".into() });
+        assert_eq!(state.phase, Phase::Reviewing);
+        state
+    }
+
+    #[test]
+    fn a_gate_set_difference_needs_an_explicit_reason_to_merge() {
+        let state = reviewing_under(gate::LEGACY_V0.to_vec());
+        assert!(gate_set_differs(&state));
+        let approved = reduce(
+            state.clone(),
+            &Event::HumanApproved {
+                reviewer: "d".into(),
+                reason: None,
+            },
+        );
+        assert!(matches!(
+            next_command(&approved),
+            Some(Command::RequestHumanReview { .. })
+        ));
+    }
+
+    #[test]
+    fn a_reasoned_approval_overrides_a_gate_set_difference() {
+        let state = reviewing_under(gate::LEGACY_V0.to_vec());
+        let approved = reduce(
+            state,
+            &Event::HumanApproved {
+                reviewer: "d".into(),
+                reason: Some("the gate set changed on purpose".into()),
+            },
+        );
+        assert_eq!(
+            next_command(&approved),
+            Some(Command::Finalize {
+                outcome: Outcome::Merged
             })
         );
     }
@@ -321,7 +436,13 @@ mod tests {
 
     #[test]
     fn fresh_task_invokes_the_agent() {
-        let state = reduce(initial(), &Event::TaskCreated { spec: spec() });
+        let state = reduce(
+            initial(),
+            &Event::TaskCreated {
+                spec: spec(),
+                gates: gate::MANDATORY_V0.to_vec(),
+            },
+        );
         assert!(matches!(
             next_command(&state),
             Some(Command::InvokeAgent { .. })
@@ -391,6 +512,7 @@ mod tests {
             state,
             &Event::HumanApproved {
                 reviewer: "d".into(),
+                reason: None,
             },
         );
         assert!(matches!(
@@ -403,7 +525,13 @@ mod tests {
     fn approved_with_gates_finalizes() {
         let state = with_passes(generated());
         let state = reduce(state, &Event::PrOpened { url: "u".into() });
-        let state = reduce(state, &Event::HumanApproved { reviewer: "d".into() });
+        let state = reduce(
+            state,
+            &Event::HumanApproved {
+                reviewer: "d".into(),
+                reason: None,
+            },
+        );
         assert_eq!(
             next_command(&state),
             Some(Command::Finalize {
@@ -416,8 +544,19 @@ mod tests {
     fn merged_is_terminal() {
         let state = with_passes(generated());
         let state = reduce(state, &Event::PrOpened { url: "u".into() });
-        let state = reduce(state, &Event::HumanApproved { reviewer: "d".into() });
-        let state = reduce(state, &Event::Merged { commit: "abc".into() });
+        let state = reduce(
+            state,
+            &Event::HumanApproved {
+                reviewer: "d".into(),
+                reason: None,
+            },
+        );
+        let state = reduce(
+            state,
+            &Event::Merged {
+                commit: "abc".into(),
+            },
+        );
         assert_eq!(next_command(&state), None);
     }
 

@@ -8,7 +8,9 @@ use std::process::Command as Process;
 use crate::event::{AgentRole, Event, GateId, GateResult};
 use crate::gate;
 use crate::knowledge::{self, Lesson};
-use crate::llm::{self, FileManifest, LiveClient, LlmClient, LlmRequest, RecordedClient, TemplateClient};
+use crate::llm::{
+    self, FileManifest, LiveClient, LlmClient, LlmRequest, RecordedClient, TemplateClient,
+};
 use crate::machine::{Command, Context, Outcome};
 use crate::sandbox::{self, RunOutput, Sandbox};
 use crate::spec::{self, Spec};
@@ -96,10 +98,13 @@ pub struct MaterializeReport {
 /// last executor manifest becomes `project/`, and the last usable reviewer
 /// verdict becomes `lessons/<task-id>.md`. No model, network, or git.
 pub fn materialize(task_dir: &Path, lessons_dir: &Path) -> Result<MaterializeReport, String> {
-    let events = crate::log::read_events(task_dir)
-        .map_err(|e| format!("cannot read the event log: {e}"))?;
+    let events =
+        crate::log::read_events(task_dir).map_err(|e| format!("cannot read the event log: {e}"))?;
     if events.is_empty() {
-        return Err(format!("no events to materialize in {}", task_dir.display()));
+        return Err(format!(
+            "no events to materialize in {}",
+            task_dir.display()
+        ));
     }
     let state = events
         .iter()
@@ -197,11 +202,7 @@ fn client_for(ctx: &ExecCtx, role: AgentRole) -> Result<Box<dyn LlmClient>, Stri
     }
 }
 
-fn invoke_agent(
-    role: AgentRole,
-    context: &Context,
-    ctx: &ExecCtx,
-) -> Result<Vec<Event>, String> {
+fn invoke_agent(role: AgentRole, context: &Context, ctx: &ExecCtx) -> Result<Vec<Event>, String> {
     let lessons = knowledge::recent_lessons(&ctx.lessons_dir, knowledge::RECENT_LESSONS)?;
     let rules = knowledge::read_rules(&ctx.rules_dir, &ctx.project_name)?;
     let current = if context.feedback.is_empty() {
@@ -291,8 +292,9 @@ fn build_review_prompt(
     rules: Option<&str>,
     lessons: &[Lesson],
 ) -> Result<String, String> {
-    let mut prompt =
-        String::from("Review the complete project below before it is offered to the human owner.\n");
+    let mut prompt = String::from(
+        "Review the complete project below before it is offered to the human owner.\n",
+    );
     push_task_spec(&mut prompt, context);
     prompt.push_str(&knowledge::rules_section(rules));
     prompt.push_str(&knowledge::prompt_section(lessons));
@@ -411,14 +413,15 @@ fn run_gate(gate_id: GateId, ctx: &ExecCtx) -> Result<Vec<Event>, String> {
     if gate_id == GateId::ReviewAgent {
         return run_review_gate(ctx);
     }
-    let argv = gate::command(gate_id)
-        .ok_or_else(|| format!("gate {} has no deterministic command in v0", gate::slug(gate_id)))?;
+    let argv = gate::command(gate_id).ok_or_else(|| {
+        format!(
+            "gate {} has no deterministic command in v0",
+            gate::slug(gate_id)
+        )
+    })?;
     let project = ctx.project_dir();
     if !project.is_dir() {
-        return Err(format!(
-            "project directory missing: {}",
-            project.display()
-        ));
+        return Err(format!("project directory missing: {}", project.display()));
     }
     let sandbox_dir = ctx
         .task_dir
@@ -450,12 +453,7 @@ fn run_gate(gate_id: GateId, ctx: &ExecCtx) -> Result<Vec<Event>, String> {
 fn run_review_gate(ctx: &ExecCtx) -> Result<Vec<Event>, String> {
     let rules = knowledge::read_rules(&ctx.rules_dir, &ctx.project_name)?;
     let lessons = knowledge::recent_lessons(&ctx.lessons_dir, knowledge::RECENT_LESSONS)?;
-    let prompt = build_review_prompt(
-        &ctx.context,
-        &ctx.project_dir(),
-        rules.as_deref(),
-        &lessons,
-    )?;
+    let prompt = build_review_prompt(&ctx.context, &ctx.project_dir(), rules.as_deref(), &lessons)?;
     let request = LlmRequest {
         role: AgentRole::Reviewer,
         prompt,
@@ -473,12 +471,7 @@ fn run_review_gate(ctx: &ExecCtx) -> Result<Vec<Event>, String> {
     };
     let wrote_lesson = !report.lessons.is_empty();
     if wrote_lesson {
-        knowledge::write_lesson(
-            &ctx.lessons_dir,
-            &ctx.task_id,
-            &ctx.title,
-            &report.lessons,
-        )?;
+        knowledge::write_lesson(&ctx.lessons_dir, &ctx.task_id, &ctx.title, &report.lessons)?;
     }
     let mut events = vec![
         Event::AgentInvoked {
@@ -534,10 +527,7 @@ fn repetition_events(
 fn open_pull_request(branch: &str, ctx: &ExecCtx) -> Result<Vec<Event>, String> {
     let project = ctx.project_dir();
     if !project.is_dir() {
-        return Err(format!(
-            "project directory missing: {}",
-            project.display()
-        ));
+        return Err(format!("project directory missing: {}", project.display()));
     }
     let mut events = Vec::new();
     if !project.join(".git").exists() {
@@ -717,7 +707,10 @@ mod tests {
         assert!(prompt.contains("name = \"hello\""));
         assert!(prompt.contains("\"files\""));
         assert!(!prompt.contains("{{crate_name}}"));
-        assert_eq!(prompt, build_prompt(&context, &template, &[], None, None).unwrap());
+        assert_eq!(
+            prompt,
+            build_prompt(&context, &template, &[], None, None).unwrap()
+        );
 
         fs::remove_dir_all(&root).unwrap();
     }
@@ -759,8 +752,14 @@ mod tests {
             name: "earlier".into(),
             body: "# Lessons — Earlier\n\n- write tests first".into(),
         }];
-        let prompt =
-            build_prompt(&context, Path::new("no-such-template-dir"), &lessons, None, None).unwrap();
+        let prompt = build_prompt(
+            &context,
+            Path::new("no-such-template-dir"),
+            &lessons,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(prompt.contains("# Lessons from previous tasks"));
         assert!(prompt.contains("--- earlier.md ---"));
         assert!(prompt.contains("- write tests first"));
@@ -934,10 +933,8 @@ mod tests {
     }
 
     fn materialize_dir(tag: &str) -> PathBuf {
-        let root = env::temp_dir().join(format!(
-            "evengate-materialize-{tag}-{}",
-            std::process::id()
-        ));
+        let root =
+            env::temp_dir().join(format!("evengate-materialize-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         root
     }
@@ -955,6 +952,7 @@ mod tests {
                     goal: "g".into(),
                     ..Spec::default()
                 },
+                gates: gate::MANDATORY_V0.to_vec(),
             },
         )
         .unwrap();
@@ -971,8 +969,8 @@ mod tests {
             &task,
             &Event::AgentResponded {
                 role: AgentRole::Reviewer,
-                response:
-                    r#"{"approve":true,"issues":[],"lessons":["import what the tests use"]}"#.into(),
+                response: r#"{"approve":true,"issues":[],"lessons":["import what the tests use"]}"#
+                    .into(),
                 tokens: Default::default(),
             },
         )
@@ -1013,6 +1011,7 @@ mod tests {
                     goal: "g".into(),
                     ..Spec::default()
                 },
+                gates: gate::MANDATORY_V0.to_vec(),
             },
         )
         .unwrap();
@@ -1055,6 +1054,7 @@ mod tests {
                     goal: "g".into(),
                     ..Spec::default()
                 },
+                gates: gate::MANDATORY_V0.to_vec(),
             },
         )
         .unwrap();
@@ -1068,10 +1068,7 @@ mod tests {
         let lessons = root.join("lessons");
         let rules = root.join("rules");
         fs::create_dir_all(&lessons).unwrap();
-        for (name, line) in [
-            ("a.md", "Keep it small."),
-            ("b.md", "keep it  small."),
-        ] {
+        for (name, line) in [("a.md", "Keep it small."), ("b.md", "keep it  small.")] {
             fs::write(lessons.join(name), format!("# Lessons\n\n- {line}\n")).unwrap();
         }
         assert!(repetition_events(&lessons, &rules, "hello")
@@ -1149,8 +1146,12 @@ mod tests {
             other => panic!("unexpected event: {other:?}"),
         }
 
-        knowledge::append_rule(&rules, "hello", "Keep the usage message consistent and clear.")
-            .unwrap();
+        knowledge::append_rule(
+            &rules,
+            "hello",
+            "Keep the usage message consistent and clear.",
+        )
+        .unwrap();
         assert!(repetition_events(&lessons, &rules, "hello")
             .unwrap()
             .is_empty());

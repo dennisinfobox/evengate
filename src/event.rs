@@ -9,8 +9,18 @@ use crate::spec::Spec;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
-    TaskCreated { spec: Spec },
-    AgentInvoked { role: AgentRole, prompt_hash: String },
+    TaskCreated {
+        spec: Spec,
+        /// Mandatory gates in force when the task was created. Empty in logs
+        /// written before this field existed; the reducer maps those to the
+        /// historical gate set so replay never reinterprets a past task.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        gates: Vec<GateId>,
+    },
+    AgentInvoked {
+        role: AgentRole,
+        prompt_hash: String,
+    },
     AgentResponded {
         role: AgentRole,
         response: String,
@@ -22,9 +32,21 @@ pub enum Event {
         stdout: String,
         stderr: String,
     },
-    GateEvaluated { gate: GateId, result: GateResult },
-    HumanApproved { reviewer: String },
-    HumanRejected { reviewer: String, reason: String },
+    GateEvaluated {
+        gate: GateId,
+        result: GateResult,
+    },
+    HumanApproved {
+        reviewer: String,
+        /// Required when the task's recorded gate set differs from the running
+        /// binary's mandatory set. This is the only gate-set override path.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    HumanRejected {
+        reviewer: String,
+        reason: String,
+    },
     /// A human asks the executor to fix a gate-blocked artifact. Valid only
     /// during `Verifying` with at least one non-passing gate verdict.
     RevisionRequested {
@@ -32,7 +54,10 @@ pub enum Event {
         guidance: Option<String>,
     },
     /// A human ends a task that a gate blocked, instead of rejecting a PR.
-    HumanAbandoned { reviewer: String, reason: String },
+    HumanAbandoned {
+        reviewer: String,
+        reason: String,
+    },
     /// Cross-task lesson counts recorded by the executor after a review.
     LessonRepeated {
         lesson: String,
@@ -40,16 +65,30 @@ pub enum Event {
         count: u32,
     },
     /// A human promoted a repeated lesson into `rules/<project>.md`.
-    LessonPromoted { reviewer: String, lesson: String },
+    LessonPromoted {
+        reviewer: String,
+        lesson: String,
+    },
     /// A human declined promotion for this task.
-    LessonDismissed { reviewer: String, lesson: String },
-    PrOpened { url: String },
-    Merged { commit: String },
-    TaskAbandoned { reason: String },
+    LessonDismissed {
+        reviewer: String,
+        lesson: String,
+    },
+    PrOpened {
+        url: String,
+    },
+    Merged {
+        commit: String,
+    },
+    TaskAbandoned {
+        reason: String,
+    },
     /// Reserved for future wall-clock checkpoints; the seed kernel never
     /// emits it because nothing it does depends on time.
     #[allow(dead_code)]
-    Tick { now_unix: u64 },
+    Tick {
+        now_unix: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -79,6 +118,8 @@ pub enum GateId {
     Compiles,
     TestsPass,
     LintsClean,
+    /// `cargo fmt --check` on the artifact.
+    FormatClean,
     /// LLM-backed review of the project tree; the last mandatory v0 gate.
     ReviewAgent,
     /// Reserved; human approval is an event, not a deterministic gate.

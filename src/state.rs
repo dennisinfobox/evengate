@@ -46,8 +46,17 @@ pub enum PromotionDecision {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "decision", rename_all = "snake_case")]
 pub enum HumanDecision {
-    Approved { reviewer: String },
-    Rejected { reviewer: String, reason: String },
+    Approved {
+        reviewer: String,
+        /// Present when the human overrode a task created under a different
+        /// gate set than the running binary.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    Rejected {
+        reviewer: String,
+        reason: String,
+    },
 }
 
 /// Denormalized snapshot. Every field is derived from events by `reduce`;
@@ -57,6 +66,11 @@ pub struct State {
     pub phase: Phase,
     pub task_created: bool,
     pub spec: Spec,
+    /// Mandatory gates recorded when the task was created. Empty only for a
+    /// state loaded from a pre-snapshot log; `gate_set()` supplies the
+    /// historical set in that case.
+    #[serde(default, skip_serializing_if = "is_legacy_gate_set")]
+    pub gates: Vec<GateId>,
     pub artifacts: Vec<ArtifactRef>,
     pub gate_results: BTreeMap<GateId, GateResult>,
     pub gate_attempts: BTreeMap<GateId, u32>,
@@ -69,6 +83,10 @@ pub struct State {
     pub token_spend: TokenUsage,
     pub human_decision: Option<HumanDecision>,
     pub agent_invocations: u32,
+    /// Agent invocations since the phase last changed. Feeds the per-phase
+    /// loop-protection budget; zero is the normal terminal value.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub phase_invocations: u32,
     pub agent_responses: u32,
     pub pr_url: Option<String>,
     pub merged_commit: Option<String>,
@@ -91,6 +109,7 @@ impl Default for State {
             phase: Phase::Drafting,
             task_created: false,
             spec: Spec::default(),
+            gates: Vec::new(),
             artifacts: Vec::new(),
             gate_results: BTreeMap::new(),
             gate_attempts: BTreeMap::new(),
@@ -100,6 +119,7 @@ impl Default for State {
             token_spend: TokenUsage::default(),
             human_decision: None,
             agent_invocations: 0,
+            phase_invocations: 0,
             agent_responses: 0,
             pr_url: None,
             merged_commit: None,
@@ -116,21 +136,55 @@ pub fn initial() -> State {
     State::default()
 }
 
+impl State {
+    /// The gates that judge this task. A task records its set at creation;
+    /// only a state loaded from a pre-snapshot log falls back to the
+    /// historical set.
+    pub fn gate_set(&self) -> &[GateId] {
+        if self.gates.is_empty() {
+            &gate::LEGACY_V0
+        } else {
+            &self.gates
+        }
+    }
+}
+
 pub fn all_mandatory_passed(state: &State) -> bool {
-    gate::MANDATORY_V0
+    state
+        .gate_set()
         .iter()
         .all(|id| matches!(state.gate_results.get(id), Some(GateResult::Pass)))
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
+}
+
+fn is_legacy_gate_set(gates: &[GateId]) -> bool {
+    gates.is_empty() || gates == gate::LEGACY_V0
+}
+
+/// Change phase and restart the per-phase invocation budget. Keeping this in
+/// one place is what makes the loop-protection counter trustworthy.
+fn enter_phase(state: &mut State, phase: Phase) {
+    state.phase = phase;
+    state.phase_invocations = 0;
 }
 
 /// Pure, total reducer. Every `(State, Event)` pair yields a valid `State`;
 /// unexpected events are recorded in `anomalies` instead of panicking.
 pub fn reduce(mut state: State, event: &Event) -> State {
     match event {
-        Event::TaskCreated { spec } => {
+        Event::TaskCreated { spec, gates } => {
             if state.task_created {
                 anomaly(&mut state, "task_created repeated");
             } else {
                 state.spec = spec.clone();
+                state.gates = if gates.is_empty() {
+                    gate::LEGACY_V0.to_vec()
+                } else {
+                    gates.clone()
+                };
                 state.task_created = true;
             }
         }
@@ -139,18 +193,19 @@ pub fn reduce(mut state: State, event: &Event) -> State {
                 anomaly(&mut state, "agent_invoked before task_created");
             }
             state.agent_invocations = state.agent_invocations.saturating_add(1);
+            state.phase_invocations = state.phase_invocations.saturating_add(1);
             match (state.phase, *role) {
-                (Phase::Drafting, AgentRole::Executor) => state.phase = Phase::Generating,
-                (Phase::Revising, AgentRole::Executor) => state.phase = Phase::Generating,
+                (Phase::Drafting, AgentRole::Executor) => {
+                    enter_phase(&mut state, Phase::Generating)
+                }
+                (Phase::Revising, AgentRole::Executor) => {
+                    enter_phase(&mut state, Phase::Generating)
+                }
                 (Phase::Verifying, AgentRole::Reviewer) => {}
                 _ => anomaly(&mut state, "agent_invoked outside its phase"),
             }
         }
-        Event::AgentResponded {
-            role,
-            tokens,
-            ..
-        } => {
+        Event::AgentResponded { role, tokens, .. } => {
             state.agent_responses = state.agent_responses.saturating_add(1);
             state.token_spend.add(*tokens);
             match (state.phase, *role) {
@@ -162,7 +217,7 @@ pub fn reduce(mut state: State, event: &Event) -> State {
                             detail: None,
                         });
                     }
-                    state.phase = Phase::Verifying;
+                    enter_phase(&mut state, Phase::Verifying);
                 }
                 (Phase::Verifying, AgentRole::Reviewer) => {}
                 _ => anomaly(&mut state, "agent_responded outside its phase"),
@@ -181,12 +236,13 @@ pub fn reduce(mut state: State, event: &Event) -> State {
             *attempts = attempts.saturating_add(1);
             state.gate_results.insert(*gate, result.clone());
         }
-        Event::HumanApproved { reviewer } => {
+        Event::HumanApproved { reviewer, reason } => {
             if state.phase != Phase::Reviewing {
                 anomaly(&mut state, "human_approved outside reviewing");
             }
             state.human_decision = Some(HumanDecision::Approved {
                 reviewer: reviewer.clone(),
+                reason: reason.clone(),
             });
         }
         Event::HumanRejected { reviewer, reason } => {
@@ -211,12 +267,11 @@ pub fn reduce(mut state: State, event: &Event) -> State {
                 } else {
                     state.revisions = state.revisions.saturating_add(1);
                     state.revision_failures = failures;
-                    state.revision_guidance = guidance
-                        .clone()
-                        .filter(|text| !text.trim().is_empty());
+                    state.revision_guidance =
+                        guidance.clone().filter(|text| !text.trim().is_empty());
                     state.gate_results.clear();
                     state.gate_attempts.clear();
-                    state.phase = Phase::Revising;
+                    enter_phase(&mut state, Phase::Revising);
                 }
             }
         }
@@ -224,7 +279,7 @@ pub fn reduce(mut state: State, event: &Event) -> State {
             if matches!(state.phase, Phase::Merged | Phase::Abandoned) {
                 anomaly(&mut state, "human_abandoned after a terminal phase");
             } else {
-                state.phase = Phase::Abandoned;
+                enter_phase(&mut state, Phase::Abandoned);
                 state.abandoned_reason = Some(reason.clone());
             }
         }
@@ -260,20 +315,20 @@ pub fn reduce(mut state: State, event: &Event) -> State {
                 anomaly(&mut state, "pr_opened outside verifying");
             }
             state.pr_url = Some(url.clone());
-            state.phase = Phase::Reviewing;
+            enter_phase(&mut state, Phase::Reviewing);
         }
         Event::Merged { commit } => {
             if all_mandatory_passed(&state)
                 && matches!(state.human_decision, Some(HumanDecision::Approved { .. }))
             {
-                state.phase = Phase::Merged;
+                enter_phase(&mut state, Phase::Merged);
                 state.merged_commit = Some(commit.clone());
             } else {
                 anomaly(&mut state, "merged without passed gates and human approval");
             }
         }
         Event::TaskAbandoned { reason } => {
-            state.phase = Phase::Abandoned;
+            enter_phase(&mut state, Phase::Abandoned);
             state.abandoned_reason = Some(reason.clone());
         }
         Event::Tick { now_unix } => {
@@ -323,6 +378,7 @@ mod tests {
                     constraints: vec!["c".into()],
                     ..Spec::default()
                 },
+                gates: gate::MANDATORY_V0.to_vec(),
             },
         )
     }
@@ -400,9 +456,104 @@ mod tests {
 
     #[test]
     fn unexpected_events_become_anomalies() {
-        let state = reduce(created(), &Event::HumanApproved { reviewer: "x".into() });
+        let state = reduce(
+            created(),
+            &Event::HumanApproved {
+                reviewer: "x".into(),
+                reason: None,
+            },
+        );
         assert_eq!(state.anomalies.len(), 1);
         assert_eq!(state.phase, Phase::Drafting);
+    }
+
+    #[test]
+    fn a_task_records_its_gate_set() {
+        let state = created();
+        assert_eq!(state.gate_set(), gate::MANDATORY_V0);
+        assert!(state.gate_set().contains(&GateId::FormatClean));
+    }
+
+    #[test]
+    fn a_legacy_state_serializes_without_the_new_fields() {
+        let state = reduce(
+            initial(),
+            &Event::TaskCreated {
+                spec: Spec {
+                    title: "hello".into(),
+                    goal: "g".into(),
+                    ..Spec::default()
+                },
+                gates: Vec::new(),
+            },
+        );
+        let json = crate::log::state_bytes(&state).unwrap();
+        assert!(!json.contains("\"gates\""), "{json}");
+        assert!(!json.contains("phase_invocations"), "{json}");
+
+        let json = crate::log::state_bytes(&created()).unwrap();
+        assert!(json.contains("\"gates\""), "{json}");
+    }
+
+    #[test]
+    fn a_log_without_a_gate_snapshot_uses_the_historical_set() {
+        let state = reduce(
+            initial(),
+            &Event::TaskCreated {
+                spec: Spec {
+                    title: "hello".into(),
+                    goal: "g".into(),
+                    ..Spec::default()
+                },
+                gates: Vec::new(),
+            },
+        );
+        assert_eq!(state.gate_set(), gate::LEGACY_V0);
+        assert!(!state.gate_set().contains(&GateId::FormatClean));
+    }
+
+    #[test]
+    fn a_phase_change_restarts_the_invocation_budget() {
+        let state = reduce(
+            created(),
+            &Event::AgentInvoked {
+                role: AgentRole::Executor,
+                prompt_hash: "0".into(),
+            },
+        );
+        assert_eq!(state.phase, Phase::Generating);
+        assert_eq!(state.phase_invocations, 0);
+
+        let state = reduce(
+            state,
+            &Event::AgentResponded {
+                role: AgentRole::Executor,
+                response: "r".into(),
+                tokens: TokenUsage::default(),
+            },
+        );
+        assert_eq!(state.phase, Phase::Verifying);
+        assert_eq!(state.phase_invocations, 0);
+    }
+
+    #[test]
+    fn an_approval_reason_is_recorded() {
+        let state = passed(generated());
+        let state = reduce(state, &Event::PrOpened { url: "u".into() });
+        let state = reduce(
+            state,
+            &Event::HumanApproved {
+                reviewer: "d".into(),
+                reason: Some("gate set changed on purpose".into()),
+            },
+        );
+        assert_eq!(
+            state.human_decision,
+            Some(HumanDecision::Approved {
+                reviewer: "d".into(),
+                reason: Some("gate set changed on purpose".into()),
+            })
+        );
     }
 
     #[test]
@@ -423,23 +574,61 @@ mod tests {
             },
         );
         let state = passed(state);
-        let state = reduce(state, &Event::Merged { commit: "abc".into() });
+        let state = reduce(
+            state,
+            &Event::Merged {
+                commit: "abc".into(),
+            },
+        );
         assert_ne!(state.phase, Phase::Merged);
         assert_eq!(state.anomalies.len(), 1);
 
-        let state = reduce(state, &Event::HumanApproved { reviewer: "d".into() });
-        let state = reduce(state, &Event::Merged { commit: "abc".into() });
+        let state = reduce(
+            state,
+            &Event::HumanApproved {
+                reviewer: "d".into(),
+                reason: None,
+            },
+        );
+        let state = reduce(
+            state,
+            &Event::Merged {
+                commit: "abc".into(),
+            },
+        );
         assert_eq!(state.phase, Phase::Merged);
         assert_eq!(state.merged_commit.as_deref(), Some("abc"));
     }
 
     #[test]
     fn token_spend_accumulates() {
-        let tokens = TokenUsage { input: 2, output: 3 };
+        let tokens = TokenUsage {
+            input: 2,
+            output: 3,
+        };
         let state = created();
-        let state = reduce(state, &Event::AgentInvoked { role: crate::event::AgentRole::Executor, prompt_hash: "0".into() });
-        let state = reduce(state, &Event::AgentResponded { role: crate::event::AgentRole::Executor, response: "r".into(), tokens });
-        assert_eq!(state.token_spend, TokenUsage { input: 2, output: 3 });
+        let state = reduce(
+            state,
+            &Event::AgentInvoked {
+                role: crate::event::AgentRole::Executor,
+                prompt_hash: "0".into(),
+            },
+        );
+        let state = reduce(
+            state,
+            &Event::AgentResponded {
+                role: crate::event::AgentRole::Executor,
+                response: "r".into(),
+                tokens,
+            },
+        );
+        assert_eq!(
+            state.token_spend,
+            TokenUsage {
+                input: 2,
+                output: 3
+            }
+        );
         assert_eq!(state.phase, Phase::Verifying);
     }
 
@@ -472,14 +661,23 @@ mod tests {
             &Event::AgentResponded {
                 role: AgentRole::Reviewer,
                 response: "{\"approve\":true}".into(),
-                tokens: TokenUsage { input: 5, output: 1 },
+                tokens: TokenUsage {
+                    input: 5,
+                    output: 1,
+                },
             },
         );
         assert!(state.anomalies.is_empty(), "{:?}", state.anomalies);
         assert_eq!(state.phase, Phase::Verifying);
         assert_eq!(state.agent_invocations, 2);
         assert_eq!(state.agent_responses, 2);
-        assert_eq!(state.token_spend, TokenUsage { input: 5, output: 1 });
+        assert_eq!(
+            state.token_spend,
+            TokenUsage {
+                input: 5,
+                output: 1
+            }
+        );
     }
 
     #[test]

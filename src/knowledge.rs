@@ -30,7 +30,6 @@ const STOPWORDS: [&str; 72] = [
 /// both lessons to agree on whether one is present.
 const NEGATIONS: [&str; 5] = ["not", "no", "never", "avoid", "cannot"];
 
-
 /// A lessons file read back from disk. `name` is the file stem (the task id).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Lesson {
@@ -165,7 +164,9 @@ pub fn lessons_match(a: &str, b: &str) -> bool {
         return false;
     }
     let left_negated = left.iter().any(|token| NEGATIONS.contains(&token.as_str()));
-    let right_negated = right.iter().any(|token| NEGATIONS.contains(&token.as_str()));
+    let right_negated = right
+        .iter()
+        .any(|token| NEGATIONS.contains(&token.as_str()));
     if left_negated != right_negated {
         return false;
     }
@@ -388,10 +389,8 @@ mod tests {
     use std::time::Duration;
 
     fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "evengate-knowledge-{tag}-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("evengate-knowledge-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         dir
     }
@@ -413,10 +412,7 @@ mod tests {
         .unwrap();
         assert_eq!(path.file_name().unwrap(), "hello.md");
         let body = fs::read_to_string(&path).unwrap();
-        assert_eq!(
-            body,
-            "# Lessons — Hello\n\n- first\n- second\n- third\n"
-        );
+        assert_eq!(body, "# Lessons — Hello\n\n- first\n- second\n- third\n");
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -529,7 +525,10 @@ mod tests {
             "Keep it small.",
             "Use cargo clippy with -D warnings."
         ));
-        assert!(!lessons_match("Do not use unsafe code.", "Use unsafe code."));
+        assert!(!lessons_match(
+            "Do not use unsafe code.",
+            "Use unsafe code."
+        ));
         assert!(!lessons_match("Keep it small.", "Do not keep it small."));
 
         let dir = temp_dir("separate");
@@ -544,7 +543,10 @@ mod tests {
         }
         let counts = count_lessons(&dir).unwrap();
         assert_eq!(counts.len(), 4);
-        assert_eq!(counts[&canonical_lesson("Do not use unsafe code.")].count, 1);
+        assert_eq!(
+            counts[&canonical_lesson("Do not use unsafe code.")].count,
+            1
+        );
         assert_eq!(counts[&canonical_lesson("Use unsafe code.")].count, 1);
 
         fs::remove_dir_all(&dir).unwrap();

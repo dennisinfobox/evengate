@@ -5,7 +5,20 @@ use crate::sandbox::RunOutput;
 
 /// Gates that must pass before a pull request may be opened in v0. The review
 /// agent runs last, on the artifact the deterministic gates have accepted.
-pub const MANDATORY_V0: [GateId; 4] = [
+/// Every task records this list at creation; later changes never reinterpret
+/// a past task's gates.
+pub const MANDATORY_V0: [GateId; 5] = [
+    GateId::Compiles,
+    GateId::TestsPass,
+    GateId::LintsClean,
+    GateId::FormatClean,
+    GateId::ReviewAgent,
+];
+
+/// The mandatory set as it stood before `FormatClean` was added. Logs that
+/// predate the per-task gate snapshot fold to this set, so replay stays
+/// byte-identical.
+pub const LEGACY_V0: [GateId; 4] = [
     GateId::Compiles,
     GateId::TestsPass,
     GateId::LintsClean,
@@ -15,12 +28,14 @@ pub const MANDATORY_V0: [GateId; 4] = [
 const COMPILES: &[&str] = &["cargo", "check", "--locked"];
 const TESTS_PASS: &[&str] = &["cargo", "test", "--locked"];
 const LINTS_CLEAN: &[&str] = &["cargo", "clippy", "--locked", "--", "-D", "warnings"];
+const FORMAT_CLEAN: &[&str] = &["cargo", "fmt", "--check"];
 
 pub fn command(gate: GateId) -> Option<&'static [&'static str]> {
     match gate {
         GateId::Compiles => Some(COMPILES),
         GateId::TestsPass => Some(TESTS_PASS),
         GateId::LintsClean => Some(LINTS_CLEAN),
+        GateId::FormatClean => Some(FORMAT_CLEAN),
         GateId::ReviewAgent | GateId::HumanApproval => None,
     }
 }
@@ -30,6 +45,7 @@ pub fn slug(gate: GateId) -> &'static str {
         GateId::Compiles => "compiles",
         GateId::TestsPass => "tests-pass",
         GateId::LintsClean => "lints-clean",
+        GateId::FormatClean => "format-clean",
         GateId::ReviewAgent => "review-agent",
         GateId::HumanApproval => "human-approval",
     }
@@ -40,6 +56,7 @@ pub fn label(gate: GateId) -> &'static str {
         GateId::Compiles => "cargo check",
         GateId::TestsPass => "cargo test",
         GateId::LintsClean => "cargo clippy",
+        GateId::FormatClean => "cargo fmt",
         GateId::ReviewAgent => "review agent",
         GateId::HumanApproval => "human approval",
     }
@@ -148,9 +165,10 @@ mod tests {
 
     #[test]
     fn failure_carries_the_first_stderr_line() {
-        let GateResult::Fail { reason } =
-            evaluate(GateId::TestsPass, &output(101, "\nthread 'x' panicked\nnote"))
-        else {
+        let GateResult::Fail { reason } = evaluate(
+            GateId::TestsPass,
+            &output(101, "\nthread 'x' panicked\nnote"),
+        ) else {
             panic!("expected fail");
         };
         assert_eq!(reason, "cargo test: thread 'x' panicked");
@@ -179,10 +197,7 @@ mod tests {
         let GateResult::Fail { reason } = evaluate(GateId::TestsPass, &out) else {
             panic!("expected fail");
         };
-        assert_eq!(
-            reason,
-            "cargo test: thread 'x' panicked at src/main.rs:4:5"
-        );
+        assert_eq!(reason, "cargo test: thread 'x' panicked at src/main.rs:4:5");
     }
 
     #[test]
@@ -201,7 +216,10 @@ mod tests {
     fn timeout_fails() {
         let mut out = output(0, "");
         out.timed_out = true;
-        assert!(matches!(evaluate(GateId::LintsClean, &out), GateResult::Fail { .. }));
+        assert!(matches!(
+            evaluate(GateId::LintsClean, &out),
+            GateResult::Fail { .. }
+        ));
     }
 
     #[test]
@@ -240,9 +258,7 @@ mod tests {
 
     #[test]
     fn review_without_issues_still_fails() {
-        let GateResult::Fail { reason } = evaluate_review(r#"{"approve": false}"#)
-            .unwrap()
-            .result
+        let GateResult::Fail { reason } = evaluate_review(r#"{"approve": false}"#).unwrap().result
         else {
             panic!("expected fail");
         };
@@ -272,5 +288,35 @@ mod tests {
     #[test]
     fn the_review_agent_is_the_last_mandatory_gate() {
         assert_eq!(*MANDATORY_V0.last().unwrap(), GateId::ReviewAgent);
+    }
+
+    #[test]
+    fn the_mandatory_set_only_grows() {
+        for gate in LEGACY_V0 {
+            assert!(MANDATORY_V0.contains(&gate), "{gate:?} was removed");
+        }
+        assert!(MANDATORY_V0.contains(&GateId::FormatClean));
+    }
+
+    #[test]
+    fn the_format_gate_checks_without_writing() {
+        assert_eq!(
+            command(GateId::FormatClean),
+            Some(&["cargo", "fmt", "--check"][..])
+        );
+        assert_eq!(slug(GateId::FormatClean), "format-clean");
+        assert_eq!(label(GateId::FormatClean), "cargo fmt");
+    }
+
+    #[test]
+    fn a_format_failure_carries_the_first_diff_line() {
+        let out = output(
+            1,
+            "Diff in /work/src/main.rs at line 3:\n fn main() {\n-    let x = 1;\n",
+        );
+        let GateResult::Fail { reason } = evaluate(GateId::FormatClean, &out) else {
+            panic!("expected fail");
+        };
+        assert_eq!(reason, "cargo fmt: Diff in /work/src/main.rs at line 3:");
     }
 }

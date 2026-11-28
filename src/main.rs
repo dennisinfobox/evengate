@@ -25,7 +25,10 @@ Usage:
   ev run <spec.md>                          start or resume a task
   ev replay <task-dir>                      rebuild state.json from events.jsonl
   ev materialize <task-dir>                 rebuild project/ and lessons from events.jsonl
-  ev approve <task-dir> --reviewer <name>   record human approval, then finalize
+  ev approve <task-dir> --reviewer <name> [--reason <text>]
+                                            record human approval, then finalize;
+                                            --reason is required when the task's
+                                            gate set differs from the binary's
   ev reject <task-dir> --reviewer <name> --reason <text>
   ev revise <task-dir> --reviewer <name> [--reason <text>]
                                             re-run the executor with the gate failures
@@ -77,9 +80,11 @@ fn run_task(args: &[String]) -> Result<(), String> {
     let mut events = log::read_events(&task_dir)
         .map_err(|e| format!("cannot read {}: {e}", log::events_path(&task_dir).display()))?;
     if events.is_empty() {
-        let created = Event::TaskCreated { spec };
-        log::append_event(&task_dir, &created)
-            .map_err(|e| format!("cannot append event: {e}"))?;
+        let created = Event::TaskCreated {
+            spec,
+            gates: gate::MANDATORY_V0.to_vec(),
+        };
+        log::append_event(&task_dir, &created).map_err(|e| format!("cannot append event: {e}"))?;
         events.push(created);
     }
     let state = fold(&events);
@@ -172,12 +177,16 @@ fn materialize(args: &[String]) -> Result<(), String> {
 
 fn decide(args: &[String], approve: bool) -> Result<(), String> {
     let usage = if approve {
-        "usage: ev approve <task-dir> --reviewer <name>"
+        "usage: ev approve <task-dir> --reviewer <name> [--reason <text>]"
     } else {
         "usage: ev reject <task-dir> --reviewer <name> --reason <text>"
     };
     let task_dir = PathBuf::from(args.get(1).ok_or(usage)?);
     let reviewer = flag(args, "--reviewer").ok_or(usage)?.to_string();
+    let reason = flag(args, "--reason")
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string);
     let mut events = log::read_events(&task_dir)
         .map_err(|e| format!("cannot read {}: {e}", log::events_path(&task_dir).display()))?;
     if events.is_empty() {
@@ -190,13 +199,29 @@ fn decide(args: &[String], approve: bool) -> Result<(), String> {
             phase_name(state.phase)
         ));
     }
+    let override_required = approve && machine::gate_set_differs(&state);
+    if override_required && reason.is_none() {
+        return Err(format!(
+            "the task was judged by a different gate set; pass --reason to override \
+             (task: {:?}, binary: {:?})",
+            state.gate_set(),
+            gate::MANDATORY_V0
+        ));
+    }
     if state.human_decision.is_some() {
-        return Err("a human decision is already recorded".into());
+        let can_reapprove = override_required
+            && matches!(
+                &state.human_decision,
+                Some(state::HumanDecision::Approved { reason: None, .. })
+            );
+        if !can_reapprove {
+            return Err("a human decision is already recorded".into());
+        }
     }
     let event = if approve {
-        Event::HumanApproved { reviewer }
+        Event::HumanApproved { reviewer, reason }
     } else {
-        let reason = flag(args, "--reason").ok_or(usage)?.to_string();
+        let reason = reason.ok_or(usage)?;
         Event::HumanRejected { reviewer, reason }
     };
     log::append_event(&task_dir, &event).map_err(|e| format!("cannot append event: {e}"))?;
@@ -242,10 +267,7 @@ fn revise(args: &[String]) -> Result<(), String> {
             machine::MAX_REVISIONS
         ));
     }
-    let event = Event::RevisionRequested {
-        reviewer,
-        guidance,
-    };
+    let event = Event::RevisionRequested { reviewer, guidance };
     log::append_event(&task_dir, &event).map_err(|e| format!("cannot append event: {e}"))?;
     events.push(event);
     let state = fold(&events);
@@ -310,8 +332,11 @@ fn promotion_decision(args: &[String], promote: bool) -> Result<(), String> {
     };
     let (lesson, repeated) = &pending[index];
     if promote {
-        let path =
-            knowledge::append_rule(&executor::rules_root(), &spec::slug(&state.spec.title), &repeated.text)?;
+        let path = knowledge::append_rule(
+            &executor::rules_root(),
+            &spec::slug(&state.spec.title),
+            &repeated.text,
+        )?;
         println!("ev: promoted to {}", path.display());
     }
     let event = if promote {
@@ -395,6 +420,9 @@ fn print_blockers(state: &State) {
             machine::MAX_REVISIONS
         );
     }
+    if state.phase == Phase::Reviewing && machine::gate_set_differs(state) {
+        println!("ev:   gate set changed; approve again with --reason to override");
+    }
 }
 
 fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
@@ -403,9 +431,7 @@ fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
 }
 
 fn fold(events: &[Event]) -> State {
-    events
-        .iter()
-        .fold(state::initial(), state::reduce)
+    events.iter().fold(state::initial(), state::reduce)
 }
 
 fn phase_name(phase: Phase) -> String {

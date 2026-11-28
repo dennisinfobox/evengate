@@ -136,7 +136,11 @@ fn validate_path(path: &str) -> Result<(), String> {
         match segment {
             "" => return Err(format!("manifest path `{path}` contains an empty segment")),
             "." => return Err(format!("manifest path `{path}` contains `.`")),
-            ".." => return Err(format!("manifest path `{path}` escapes the project with `..`")),
+            ".." => {
+                return Err(format!(
+                    "manifest path `{path}` escapes the project with `..`"
+                ))
+            }
             _ => {}
         }
     }
@@ -235,11 +239,7 @@ struct RoleModels {
 
 impl RoleModels {
     fn from_env() -> Self {
-        let read = |name: &str| {
-            env::var(name)
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-        };
+        let read = |name: &str| env::var(name).ok().filter(|value| !value.trim().is_empty());
         RoleModels {
             default: read("EVENGATE_MODEL"),
             planner: read("EVENGATE_MODEL_PLANNER"),
@@ -317,7 +317,9 @@ impl LlmClient for LiveClient {
                 },
             ],
             max_tokens: self.max_tokens,
-            response_format: ResponseFormat { kind: "json_object" },
+            response_format: ResponseFormat {
+                kind: "json_object",
+            },
         };
         let agent = ureq::Agent::config_builder()
             .timeout_global(Some(self.timeout))
@@ -617,7 +619,10 @@ mod tests {
             Event::AgentResponded {
                 role: AgentRole::Executor,
                 response: "first".into(),
-                tokens: TokenUsage { input: 1, output: 2 },
+                tokens: TokenUsage {
+                    input: 1,
+                    output: 2,
+                },
             },
             Event::AgentInvoked {
                 role: AgentRole::Executor,
@@ -632,7 +637,13 @@ mod tests {
         let client = RecordedClient::from_events(&events);
         let first = client.complete(&prompt).unwrap();
         assert_eq!(first.text, "first");
-        assert_eq!(first.tokens, TokenUsage { input: 1, output: 2 });
+        assert_eq!(
+            first.tokens,
+            TokenUsage {
+                input: 1,
+                output: 2
+            }
+        );
         assert_eq!(client.complete(&request("second")).unwrap().text, "second");
         assert!(client.complete(&request("third")).is_err());
     }
@@ -657,7 +668,10 @@ mod tests {
         assert!(error.contains("does not match"));
     }
 
-    fn stub_server(status: &'static str, payload: String) -> (String, thread::JoinHandle<Option<String>>) {
+    fn stub_server(
+        status: &'static str,
+        payload: String,
+    ) -> (String, thread::JoinHandle<Option<String>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let handle = thread::spawn(move || {
@@ -731,7 +745,13 @@ mod tests {
         let (url, server) = stub_server("200 OK", payload);
         let response = live_client(url).complete(&request("hello prompt")).unwrap();
         assert_eq!(response.text, "{\"files\":{\"a.txt\":\"hi\"}}");
-        assert_eq!(response.tokens, TokenUsage { input: 3, output: 4 });
+        assert_eq!(
+            response.tokens,
+            TokenUsage {
+                input: 3,
+                output: 4
+            }
+        );
         assert_eq!(server.join().unwrap().as_deref(), Some("Bearer secret"));
     }
 
@@ -741,7 +761,9 @@ mod tests {
             "500 Internal Server Error",
             r#"{"error":"provider exploded"}"#.to_string(),
         );
-        let error = live_client(url).complete(&request("hello prompt")).unwrap_err();
+        let error = live_client(url)
+            .complete(&request("hello prompt"))
+            .unwrap_err();
         assert!(error.contains("500"), "{error}");
         assert!(error.contains("provider exploded"), "{error}");
         server.join().unwrap();

@@ -1,6 +1,8 @@
-# Evengate — Technical Specification v0.15
+# Evengate — Technical Specification v0.16
 
 > A deterministic, Rust-native software factory that builds and improves itself under human oversight, and later produces pet projects in a familiar way.
+
+**Changes from v0.15:** the mandatory set gains `FormatClean` (`cargo fmt --check`); every task records the gate set in force at creation, so a later gate change never reinterprets an old log, and merging under a different set requires an explicit `HumanApproved { reason }`; agent invocations are budgeted per phase (§7.1–§7.3, §7.6, §10.2, §10.3, ADR-0019, ADR-0020).
 
 **Changes from v0.14:** the review prompt now carries the five most recent lesson files and instructs verbatim reuse of a still-applicable lesson, so repetition is observable for promotion; `LiveClient` requests `response_format: {"type":"json_object"}` so a local model cannot return an unescaped-quote reply (§7.5, §7.8, ADR-0017, ADR-0018).
 
@@ -163,7 +165,7 @@ tasks/<task-id>/
   artifacts/      -- produced files, patches, logs
 ```
 
-**Replay guarantee:** `ev replay <task-id>` reads `events.jsonl`, folds through `reduce`, and produces a `State` identical to the live run when the snapshot was written by the same reducer. Live LLM responses are recorded as events, so replay never calls the network. The guarantee is about determinism, not backward compatibility: when the gate set or reducer changes, replaying an older log records the resulting anomaly and reports the snapshot mismatch instead of rewriting history. `tasks/hello` is such a frozen snapshot (§14, ADR-0015).
+**Replay guarantee:** `ev replay <task-id>` reads `events.jsonl`, folds through `reduce`, and produces a `State` identical to the live run when the snapshot was written by the same reducer. Live LLM responses are recorded as events, so replay never calls the network. The guarantee is about determinism, not backward compatibility: when the reducer changes, replaying an older log records the resulting anomaly and reports the snapshot mismatch instead of rewriting history. A gate-set change no longer reinterprets old tasks, because each `TaskCreated` records the gates in force at the time; logs that predate that field fold to `LEGACY_V0`. `tasks/hello` remains the pre-snapshot exception (§14, ADR-0015).
 
 **Execution replay:** `ev materialize <task-id>` reconstructs the gitignored `project/` tree and `lessons/<task-id>.md` from `AgentResponded` events in log order. The last executor manifest wins; the last usable reviewer verdict supplies the lesson. It calls no model, spawns nothing, and leaves `state.json` untouched, so the pure-fold guarantee of `ev replay` is unchanged. Only recorded files are recreated: a local `.git` or `target/` inside `project/` is dropped, and the bare remote under `artifacts/` is untouched.
 
@@ -203,12 +205,12 @@ The loop is boring on purpose. All intelligence lives in `next_command` and in t
 
 ```rust
 pub enum Event {
-    TaskCreated { spec: Spec },
+    TaskCreated { spec: Spec, gates: Vec<GateId> },
     AgentInvoked { role: AgentRole, prompt_hash: String },
     AgentResponded { role: AgentRole, response: String, tokens: TokenUsage },
     CommandExecuted { cmd: String, exit_code: i32, stdout: String, stderr: String },
     GateEvaluated { gate: GateId, result: GateResult },
-    HumanApproved { reviewer: String },
+    HumanApproved { reviewer: String, reason: Option<String> },
     HumanRejected { reviewer: String, reason: String },
     RevisionRequested { reviewer: String, guidance: Option<String> },
     HumanAbandoned { reviewer: String, reason: String },
@@ -230,14 +232,16 @@ All events are serialized as JSON Lines with stable field ordering. The log is t
 pub struct State {
     pub phase: Phase,           // Drafting, Generating, Verifying, Revising, Reviewing, Merged, ...
     pub spec: Spec,
+    pub gates: Vec<GateId>,     // recorded at TaskCreated; never re-derived
     pub artifacts: Vec<ArtifactRef>,
     pub gate_results: HashMap<GateId, GateResult>,
+    pub phase_invocations: u32, // loop-protection budget for the current phase
     pub token_spend: TokenUsage,
     pub human_decision: Option<HumanDecision>,
 }
 ```
 
-`reduce` must be total: every `(State, Event)` pair produces a valid `State`, even if the event is unexpected in the current phase (in which case it is recorded as an anomaly, not a panic).
+`reduce` must be total: every `(State, Event)` pair produces a valid `State`, even if the event is unexpected in the current phase (in which case it is recorded as an anomaly, not a panic). The gate set is part of the task, not of the reducer: logs written before it was recorded fold to `LEGACY_V0`.
 
 ### 7.3 `machine.rs` — the deterministic policy
 
@@ -257,8 +261,9 @@ pub enum Command {
 **Invariants enforced here:**
 
 - `InvokeAgent` is never issued for a role that already produced a response in the current phase without an intervening gate.
-- `Finalize { Merged }` is unreachable unless every mandatory gate passed **and** a `HumanApproved` event exists.
-- No command is issued twice in a row with identical parameters (loop protection).
+- `Finalize { Merged }` is unreachable unless every gate in the task's recorded set passed **and** a `HumanApproved` event exists.
+- A task whose recorded gate set differs from the running binary's `MANDATORY_V0` can merge only through `HumanApproved { reason }`; a bare approval leaves it at `RequestHumanReview`.
+- No command is issued twice in a row with identical parameters (loop protection): each branch is keyed by a verdict or counter that only an intervening event changes, `MAX_AGENT_INVOCATIONS_PER_PHASE = 5` stops a phase that stops advancing, gate retries are capped at `MAX_GATE_ATTEMPTS = 2`, and revisions at `MAX_REVISIONS = 2`.
 
 **Revision path.** A gate that still fails after `MAX_GATE_ATTEMPTS`, or a review rejection, leaves the task in `Verifying` with `RequestHumanReview`. The human may then issue `RevisionRequested`, which is accepted only in `Verifying` with at least one non-passing verdict. The reducer snapshots those verdicts and the optional guidance into `State`, increments the revision counter, clears every gate verdict and attempt counter, and enters `Revising`. `next_command` then issues one `InvokeAgent` whose `Context` carries the failures and whose prompt includes the current project tree; the response moves the task to `Generating` and back to `Verifying`, so every gate runs again on the new tree. Revisions are capped at `MAX_REVISIONS` (2); at the cap the machine requests a human again. `HumanAbandoned` ends the task from any non-terminal phase, while `TaskAbandoned` remains the consequence of rejecting a PR.
 
@@ -335,12 +340,13 @@ pub trait Gate {
 | `Compiles` | Deterministic | `cargo check --locked` in sandbox, exit 0 |
 | `TestsPass` | Deterministic | `cargo test --locked`, all green |
 | `LintsClean` | Deterministic | `cargo clippy --locked -- -D warnings` |
+| `FormatClean` | Deterministic | `cargo fmt --check`, exit 0 |
 | `ReviewAgent` | LLM (recorded) | Project tree (path → contents) → structured verdict `{approve: bool, issues: []}` |
 | `HumanApproval` | Human | Explicit `HumanApproved` event |
 
 **Rule:** the executing agent has no mechanism to mark a gate as passed. Gates own their verdicts.
 
-`Compiles`, `TestsPass`, `LintsClean`, and `ReviewAgent` are the mandatory v0 gates, in that order. The review agent runs on the artifact the deterministic gates accepted, records its request and raw response as `Reviewer` events, and maps a withheld approval to `Fail` with the issues as the reason. A rejection stops the run for a human immediately rather than re-asking the same tree; an unusable verdict becomes `NeedsHuman`. Review requires a model: with the offline `TemplateClient` the run stops at this gate with an actionable error and resumes once a model is configured. The executor cannot pass this gate on the reviewer's behalf. From a blocked state the human can `ev revise` (executor re-runs with the verdicts) or `ev abandon`; see §7.3. The verdict's `lessons` are written to `lessons/<task-id>.md` before the gate result is recorded; a revision overwrites the same file.
+`Compiles`, `TestsPass`, `LintsClean`, `FormatClean`, and `ReviewAgent` are the mandatory v0 gates, in that order. `TaskCreated` records that list, so a later gate addition or removal never reinterprets an older task. The review agent runs on the artifact the deterministic gates accepted, records its request and raw response as `Reviewer` events, and maps a withheld approval to `Fail` with the issues as the reason. A rejection stops the run for a human immediately rather than re-asking the same tree; an unusable verdict becomes `NeedsHuman`. Review requires a model: with the offline `TemplateClient` the run stops at this gate with an actionable error and resumes once a model is configured. The executor cannot pass this gate on the reviewer's behalf. From a blocked state the human can `ev revise` (executor re-runs with the verdicts) or `ev abandon`; see §7.3. The verdict's `lessons` are written to `lessons/<task-id>.md` before the gate result is recorded; a revision overwrites the same file.
 
 ### 7.7 `sandbox.rs` — process isolation
 
@@ -473,14 +479,14 @@ A task is a **self-improvement task** if its spec targets a file under `src/` of
 
 - The `HumanApproval` gate is mandatory and non-waivable for self-edits.
 - Evengate's own `Compiles` and `TestsPass` gates run on the modified Evengate **before** the PR is opened, using a separate checkout.
-- A self-edit that removes or weakens a gate is rejected by `machine.rs` with no path forward except human override (recorded as an explicit `HumanApproved { reviewer, reason }` event). This is principle 12 in action: the name is the contract.
+- A task's gate set is recorded in `TaskCreated` and is immutable for that task. `machine.rs` never judges an artifact against a set other than the recorded one, and its gate-order test rejects a mandatory set that drops a historical gate. A task whose recorded set differs from the running binary's set cannot merge on a bare approval: `ev approve --reason <text>` records `HumanApproved { reviewer, reason }`, the only override path. This is principle 12 in action: the name is the contract.
 
 ### 10.3 Loop protection
 
-- No command repeated with identical arguments back-to-back.
-- Maximum N agent invocations per phase (default: 5).
-- Maximum N retries per gate (default: 2). After that, `NeedsHuman`.
-- Maximum N human-requested revisions per task (default: 2). Each revision resets the per-gate attempt counter, so total executor retries stay bounded.
+- No command repeated with identical arguments back-to-back. Every `next_command` branch is keyed by a verdict or counter that only an intervening event changes.
+- Maximum N agent invocations per phase (`MAX_AGENT_INVOCATIONS_PER_PHASE = 5`); the reducer resets the counter on every phase change, and `machine.rs` stops with `RequestHumanReview` at the cap.
+- Maximum N retries per gate (`MAX_GATE_ATTEMPTS = 2`). After that, `NeedsHuman`.
+- Maximum N human-requested revisions per task (`MAX_REVISIONS = 2`). Each revision resets the per-gate attempt counter, so total executor retries stay bounded.
 
 ---
 

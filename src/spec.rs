@@ -87,7 +87,11 @@ pub fn parse(markdown: &str) -> Result<Spec, SpecError> {
     if spec.goal.is_empty() {
         return Err(SpecError("missing or empty `## Goal` section".into()));
     }
-    let paragraphs = spec.goal.split("\n\n").filter(|p| !p.trim().is_empty()).count();
+    let paragraphs = spec
+        .goal
+        .split("\n\n")
+        .filter(|p| !p.trim().is_empty())
+        .count();
     if paragraphs > 1 {
         return Err(SpecError(
             "`## Goal` must be a single paragraph; split the task instead".into(),
@@ -97,7 +101,9 @@ pub fn parse(markdown: &str) -> Result<Spec, SpecError> {
         return Err(SpecError("missing or empty `## Acceptance` section".into()));
     }
     if spec.constraints.is_empty() {
-        return Err(SpecError("missing or empty `## Constraints` section".into()));
+        return Err(SpecError(
+            "missing or empty `## Constraints` section".into(),
+        ));
     }
 
     Ok(spec)

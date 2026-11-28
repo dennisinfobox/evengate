@@ -4,13 +4,13 @@ A deterministic, Rust-native software factory that builds and improves itself un
 
 **Evengate** = *event* + *gate*: all state is derived from an append-only event log, and nothing moves without passing a gate.
 
-Status: phase 1 — the first model-authored project is merged, review lessons feed the next prompt, and a lesson repeated across three tasks pauses for human promotion. See `docs/STATUS.md`.
+Status: month 2 — the mandatory gates include `cargo fmt --check`, each task records the gate set it was created under, and merging across a gate-set change needs a reasoned human override. See `docs/STATUS.md`.
 
 ## Documentation
 
 | File | Purpose |
 |---|---|
-| [`docs/spec.md`](docs/spec.md) | Authoritative design, v0.13 |
+| [`docs/spec.md`](docs/spec.md) | Authoritative design, v0.16 |
 | [`docs/STATUS.md`](docs/STATUS.md) | Current phase, next step, blockers |
 | [`docs/DECISIONS.md`](docs/DECISIONS.md) | Decision log with rationale |
 | [`AGENTS.md`](AGENTS.md) | Rules for agents and contributors |
@@ -50,7 +50,9 @@ Gate containers run read-only with no network, a read-only project mount, a 1 Gi
 
 The executing agent defaults to the offline `TemplateClient`. Set `EVENGATE_LLM_URL` (an OpenAI-compatible chat-completions endpoint) to switch to `LiveClient`; `EVENGATE_LLM=template|live|recorded` overrides the choice. Live requests ask for a JSON object (`response_format`), so a model cannot return an unescaped-quote reply. Live mode reads `EVENGATE_LLM_API_KEY`, `EVENGATE_MODEL_EXECUTOR`/`_PLANNER`/`_REVIEWER` (fallback `EVENGATE_MODEL`), `EVENGATE_LLM_TIMEOUT_SECS`, and `EVENGATE_LLM_MAX_TOKENS`.
 
-The `ReviewAgent` gate is mandatory and needs a model. With no endpoint configured, `ev run` executes the template agent and the three deterministic gates, then stops at the review gate with an actionable error; re-run with `EVENGATE_LLM_URL` set to finish the review and open the PR. `ev replay` is always offline.
+The `ReviewAgent` gate is mandatory and needs a model. With no endpoint configured, `ev run` executes the template agent and the four deterministic gates — `cargo check`, `cargo test`, `cargo clippy -- -D warnings`, and `cargo fmt --check` — then stops at the review gate with an actionable error; re-run with `EVENGATE_LLM_URL` set to finish the review and open the PR. `ev replay` is always offline.
+
+`TaskCreated` records the mandatory gate set in force for that task, so adding or removing a gate never reinterprets an old log. A task whose recorded set differs from the running binary's can merge only with `ev approve <task-dir> --reviewer <name> --reason <text>`; a bare approval stops at `RequestHumanReview`.
 
 When a gate blocks a task, `ev revise` re-runs the executor with the failing verdicts, any human guidance, and the current project tree, then reruns every gate (at most two revisions). `ev abandon` ends a blocked task without a PR.
 
