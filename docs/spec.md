@@ -309,7 +309,7 @@ pub struct TemplateClient { /* offline: renders templates/ into a manifest */ }
 {"files": {"src/main.rs": "fn main() {}\n"}}
 ```
 
-A self-edit with exactly one file target skips JSON: the request switches to `RequestFormat::SingleFile`, whose system prompt demands the file and nothing else, and the model returns that file's complete contents as plain text. A fenced block is unwrapped. The format is part of the prompt hash. A directory target or several targets uses the manifest. The executor validates every path (relative, `/` separators, no `.`/`..`, bounded count and size), replaces `project/` for a generated project, overlays it for a self-edit, and only then runs the gates. Prompt assembly is deterministic: the full spec and the reference template are rendered in declaration/sorted order, so the recorded prompt hash is reproducible.
+A self-edit with exactly one file target skips JSON: the request switches to `RequestFormat::SingleFile`, whose system prompt demands the file and nothing else, and the model returns that file's complete contents as plain text. A fenced block is unwrapped. The format is part of the prompt hash, and a single-file request omits the JSON `response_format` constraint. A directory target or several targets uses the manifest. The executor validates every path (relative, `/` separators, no `.`/`..`, bounded count and size), replaces `project/` for a generated project, overlays it for a self-edit, and only then runs the gates. Prompt assembly is deterministic: the full spec and the reference template are rendered in declaration/sorted order, so the recorded prompt hash is reproducible.
 
 **Review protocol.** The reviewer answers one JSON object with an approval, concrete issues, and 3–5 short lessons:
 

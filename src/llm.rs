@@ -348,9 +348,9 @@ impl LlmClient for LiveClient {
                 },
             ],
             max_tokens: self.max_tokens,
-            response_format: ResponseFormat {
+            response_format: (request.format == RequestFormat::Default).then_some(ResponseFormat {
                 kind: "json_object",
-            },
+            }),
         };
         let agent = ureq::Agent::config_builder()
             .timeout_global(Some(self.timeout))
@@ -408,7 +408,8 @@ struct ChatRequest<'a> {
     messages: Vec<ChatMessageIn<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u64>,
-    response_format: ResponseFormat,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_format: Option<ResponseFormat>,
 }
 
 /// Both roles must answer with a JSON object. Asking the server for JSON mode
@@ -713,6 +714,7 @@ mod tests {
     fn stub_server(
         status: &'static str,
         payload: String,
+        expect_json: bool,
     ) -> (String, thread::JoinHandle<Option<String>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -750,7 +752,11 @@ mod tests {
             assert_eq!(sent["model"], "test-model");
             assert_eq!(sent["messages"][0]["role"], "system");
             assert_eq!(sent["messages"][1]["content"], "hello prompt");
-            assert_eq!(sent["response_format"]["type"], "json_object");
+            if expect_json {
+                assert_eq!(sent["response_format"]["type"], "json_object");
+            } else {
+                assert!(sent.get("response_format").is_none());
+            }
             let response = format!(
                 "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
                 payload.len()
@@ -784,7 +790,7 @@ mod tests {
             "usage": { "prompt_tokens": 3, "completion_tokens": 4 }
         })
         .to_string();
-        let (url, server) = stub_server("200 OK", payload);
+        let (url, server) = stub_server("200 OK", payload, true);
         let response = live_client(url).complete(&request("hello prompt")).unwrap();
         assert_eq!(response.text, "{\"files\":{\"a.txt\":\"hi\"}}");
         assert_eq!(
@@ -798,10 +804,26 @@ mod tests {
     }
 
     #[test]
+    fn single_file_requests_omit_json_mode() {
+        let payload = serde_json::json!({
+            "choices": [{"message": {"content": "fn main() {}\n"}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 2}
+        })
+        .to_string();
+        let (url, server) = stub_server("200 OK", payload, false);
+        let mut req = request("hello prompt");
+        req.format = RequestFormat::SingleFile;
+        let response = live_client(url).complete(&req).unwrap();
+        assert_eq!(response.text, "fn main() {}\n");
+        server.join().unwrap();
+    }
+
+    #[test]
     fn live_client_reports_http_errors_with_the_body() {
         let (url, server) = stub_server(
             "500 Internal Server Error",
             r#"{"error":"provider exploded"}"#.to_string(),
+            true,
         );
         let error = live_client(url)
             .complete(&request("hello prompt"))
