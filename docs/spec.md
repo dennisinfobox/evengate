@@ -1,6 +1,8 @@
-# Evengate — Technical Specification v0.16
+# Evengate — Technical Specification v0.17
 
 > A deterministic, Rust-native software factory that builds and improves itself under human oversight, and later produces pet projects in a familiar way.
+
+**Changes from v0.16:** a spec can name `## Target` files; when one targets `src/`, the executor bases `project/` on a copy of this repository, refuses the offline template agent, and requires the complete tree. The sandbox image pre-fetches the locked dependency set so Evengate's own gates build offline (§7.4, §7.7, §8, §10.2, ADR-0021, ADR-0022).
 
 **Changes from v0.15:** the mandatory set gains `FormatClean` (`cargo fmt --check`); every task records the gate set in force at creation, so a later gate change never reinterprets an old log, and merging under a different set requires an explicit `HumanApproved { reason }`; agent invocations are budgeted per phase (§7.1–§7.3, §7.6, §10.2, §10.3, ADR-0019, ADR-0020).
 
@@ -279,6 +281,8 @@ The executor must never mutate `State` directly. It only returns events. A faili
 
 The same module owns `materialize`: it applies recorded executor manifests and reviewer lessons to disk in log order. It is the impure counterpart to `ev replay`, not part of the `Command` loop, and it never changes the log or the snapshot.
 
+**Self-edit tasks.** A spec whose `## Target` lists a path under `src/` is a self-improvement task (§10.2). On its first invocation the executor copies this repository into `project/`, excluding `.git`, `target`, `.tmp`, and the generated `tasks/*/project` and `tasks/*/artifacts` trees, and sends that tree to the executor. The prompt requires the complete tree back, because a manifest replaces `project/` wholesale; an omitted file is a deletion. The copy is the separate checkout the deterministic gates judge in the sandbox, so the live working tree is never mutated. The offline `TemplateClient` refuses a self-edit, because rendering `templates/bin` would replace Evengate with an unrelated crate.
+
 ### 7.5 `llm/` — the model boundary
 
 ```rust
@@ -364,6 +368,8 @@ pub trait Gate {
 - Output size cap (default: 1 MiB per stream); excess is truncated with a marker.
 - Limits are overridable with `EVENGATE_SANDBOX_MEMORY`, `EVENGATE_SANDBOX_CPUS`, and `EVENGATE_SANDBOX_PIDS`.
 
+The image is built from `sandbox/Dockerfile` with the repository root as the build context. It installs clippy and rustfmt at build time and runs `cargo fetch --locked` on this repository's manifests, so a self-edit gate run can compile Evengate with `--network=none`.
+
 ### 7.8 `knowledge.rs` — the accumulator
 
 Knowledge is **structured, versioned, and fed back into prompts**. Not a vector store. Not a RAG index in v0.
@@ -418,6 +424,10 @@ One paragraph. What the user wants, in outcome terms.
 
 ## Non-goals
 - Explicitly out of scope.
+
+## Target
+- Repository-relative file or directory this task edits; omit for a generated project.
+- A path under `src/` marks the task as a self-edit.
 
 ## Context
 Links to relevant files, ADRs, prior tasks.
@@ -475,7 +485,7 @@ If `Goal`, `Acceptance`, or `Constraints` is missing, the spec is rejected at `T
 
 ### 10.2 What counts as self-improvement
 
-A task is a **self-improvement task** if its spec targets a file under `src/` of Evengate. Evengate is allowed to modify itself under these rules:
+A task is a **self-improvement task** if its spec's `## Target` names a file under `src/` of Evengate. On first invocation `project/` is a copy of the repository, and the gates run on that copy in the sandbox. Evengate is allowed to modify itself under these rules:
 
 - The `HumanApproval` gate is mandatory and non-waivable for self-edits.
 - Evengate's own `Compiles` and `TestsPass` gates run on the modified Evengate **before** the PR is opened, using a separate checkout.

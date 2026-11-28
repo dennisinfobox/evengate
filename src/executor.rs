@@ -43,6 +43,7 @@ pub struct ExecCtx {
     pub lessons_dir: PathBuf,
     pub rules_dir: PathBuf,
     task_id: String,
+    self_edit: bool,
     context: Context,
 }
 
@@ -65,6 +66,7 @@ impl ExecCtx {
             lessons_dir,
             rules_dir,
             task_id,
+            self_edit: spec.is_self_edit(),
             context: Context::from_spec(spec),
         }
     }
@@ -72,6 +74,93 @@ impl ExecCtx {
     fn project_dir(&self) -> PathBuf {
         self.task_dir.join("project")
     }
+
+    /// Nearest ancestor that is the Evengate repository. A task directory
+    /// lives inside it, so a self-edit copy never depends on the caller's
+    /// working directory.
+    fn repo_root(&self) -> Result<PathBuf, String> {
+        for dir in self.task_dir.ancestors() {
+            if dir.join(".git").exists()
+                && dir.join("Cargo.toml").is_file()
+                && dir.join("src").is_dir()
+            {
+                return Ok(dir.to_path_buf());
+            }
+        }
+        Err(format!(
+            "self-edit task {} is not inside the Evengate repository",
+            self.task_dir.display()
+        ))
+    }
+
+    /// A self-edit starts from a copy of the repository, not from a template.
+    /// The copy is the separate checkout the gates judge; the live tree is
+    /// never touched.
+    fn seed_self_edit(&self) -> Result<(), String> {
+        let project = self.project_dir();
+        if project.exists() {
+            return Ok(());
+        }
+        let repo = self.repo_root()?;
+        copy_self_edit_tree(&repo, &project)?;
+        for target in &self.context.target {
+            let clean = target.trim().replace('\\', "/");
+            if !clean.is_empty() && !project.join(&clean).exists() {
+                return Err(format!(
+                    "self-edit target does not exist in the repository: {target}"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+const SELF_EDIT_SKIP_DIRS: [&str; 3] = [".git", "target", ".tmp"];
+
+/// Copy the repository without VCS metadata, build output, or generated task
+/// artifacts. The result is the self-edit working tree and the base for every
+/// gate sandbox.
+fn copy_self_edit_tree(src: &Path, dst: &Path) -> Result<(), String> {
+    copy_self_edit_entries(src, dst, Path::new(""))
+}
+
+fn copy_self_edit_entries(src: &Path, dst: &Path, rel: &Path) -> Result<(), String> {
+    fs::create_dir_all(dst).map_err(|e| format!("cannot create {}: {e}", dst.display()))?;
+    let mut entries = fs::read_dir(src)
+        .map_err(|e| format!("cannot read {}: {e}", src.display()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("cannot read {}: {e}", src.display()))?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let file_name = entry.file_name();
+        let name = file_name.to_string_lossy();
+        if SELF_EDIT_SKIP_DIRS.contains(&name.as_ref()) {
+            continue;
+        }
+        if matches!(name.as_ref(), "project" | "artifacts")
+            && rel.starts_with("tasks")
+            && rel.components().count() == 2
+        {
+            continue;
+        }
+        let from = entry.path();
+        let to = dst.join(&file_name);
+        let file_type = entry
+            .file_type()
+            .map_err(|e| format!("cannot stat {}: {e}", from.display()))?;
+        if file_type.is_dir() {
+            copy_self_edit_entries(&from, &to, &rel.join(&file_name))?;
+        } else if file_type.is_file() {
+            fs::copy(&from, &to)
+                .map_err(|e| format!("cannot copy {} to {}: {e}", from.display(), to.display()))?;
+        } else {
+            return Err(format!(
+                "repository entry is not a file or directory: {}",
+                from.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Execute one command, performing its side effects and returning the events
@@ -185,6 +274,10 @@ fn client_mode() -> Result<ClientMode, String> {
 
 fn client_for(ctx: &ExecCtx, role: AgentRole) -> Result<Box<dyn LlmClient>, String> {
     match client_mode()? {
+        ClientMode::Template if role != AgentRole::Reviewer && ctx.self_edit => Err(
+            "self-edit tasks require a model: set EVENGATE_LLM_URL (the offline template agent cannot edit the repository)"
+                .into(),
+        ),
         ClientMode::Template if role != AgentRole::Reviewer => Ok(Box::new(TemplateClient::new(
             ctx.templates_dir.clone(),
             ctx.project_name.clone(),
@@ -203,12 +296,16 @@ fn client_for(ctx: &ExecCtx, role: AgentRole) -> Result<Box<dyn LlmClient>, Stri
 }
 
 fn invoke_agent(role: AgentRole, context: &Context, ctx: &ExecCtx) -> Result<Vec<Event>, String> {
+    let client = client_for(ctx, role)?;
     let lessons = knowledge::recent_lessons(&ctx.lessons_dir, knowledge::RECENT_LESSONS)?;
     let rules = knowledge::read_rules(&ctx.rules_dir, &ctx.project_name)?;
-    let current = if context.feedback.is_empty() {
-        None
-    } else {
+    let current = if !context.feedback.is_empty() {
         Some(read_project_files(&ctx.project_dir())?)
+    } else if ctx.self_edit {
+        ctx.seed_self_edit()?;
+        Some(read_project_files(&ctx.project_dir())?)
+    } else {
+        None
     };
     let prompt = build_prompt(
         context,
@@ -218,7 +315,6 @@ fn invoke_agent(role: AgentRole, context: &Context, ctx: &ExecCtx) -> Result<Vec
         current.as_ref(),
     )?;
     let request = LlmRequest { role, prompt };
-    let client = client_for(ctx, role)?;
     let response = client.complete(&request)?;
     let manifest = FileManifest::parse(&response.text)?;
     apply_manifest(&manifest, &ctx.project_dir())?;
@@ -244,9 +340,16 @@ fn build_prompt(
     rules: Option<&str>,
     current: Option<&BTreeMap<String, String>>,
 ) -> Result<String, String> {
+    let self_edit = context.target.iter().any(|path| spec::targets_self(path));
     let mut prompt = String::new();
     if context.feedback.is_empty() {
-        prompt.push_str("Build the complete project described below.\n");
+        if self_edit {
+            prompt.push_str(
+                "Edit the existing Evengate project described below. Keep every file the task does not change.\n",
+            );
+        } else {
+            prompt.push_str("Build the complete project described below.\n");
+        }
     } else {
         prompt.push_str(
             "Revise the existing project described below. Every issue under Revision feedback must be fixed.\n",
@@ -258,9 +361,15 @@ fn build_prompt(
     prompt.push_str(&knowledge::prompt_section(lessons));
 
     if let Some(files) = current {
-        prompt.push_str(
-            "\n# Current project\nThese are the files the gates judged. Edit them into the answer instead of starting over.\n",
-        );
+        if self_edit {
+            prompt.push_str(
+                "\n# Current project\nThis is a copy of the Evengate repository. Apply the task to these files and keep the rest unchanged.\n",
+            );
+        } else {
+            prompt.push_str(
+                "\n# Current project\nThese are the files the gates judged. Edit them into the answer instead of starting over.\n",
+            );
+        }
         for (path, content) in files {
             let _ = writeln!(prompt, "\n--- {path} ---\n{content}");
         }
@@ -281,6 +390,11 @@ fn build_prompt(
          {\"files\": {\"relative/path\": \"file contents\"}}\n\
          Every path must be relative, use `/`, and contain no `..`. Include every file the project needs.\n",
     );
+    if self_edit {
+        prompt.push_str(
+            "Return the complete repository tree, not only the changed files: any file you omit is deleted from the project.\n",
+        );
+    }
     Ok(prompt)
 }
 
@@ -316,6 +430,7 @@ fn push_task_spec(prompt: &mut String, context: &Context) {
     let _ = writeln!(prompt, "\n# Task\nTitle: {}", context.title);
     let _ = writeln!(prompt, "Project: {}", context.project);
     let _ = writeln!(prompt, "\n## Goal\n{}", context.goal.trim());
+    push_list(prompt, "Target", &context.target);
     push_list(prompt, "Acceptance", &context.acceptance);
     push_list(prompt, "Constraints", &context.constraints);
     push_list(prompt, "Non-goals", &context.non_goals);
@@ -695,6 +810,7 @@ mod tests {
             acceptance: vec!["it compiles".into()],
             constraints: vec!["no crates".into()],
             non_goals: Vec::new(),
+            target: Vec::new(),
             context: Vec::new(),
             open_questions: Vec::new(),
             feedback: Vec::new(),
@@ -713,6 +829,105 @@ mod tests {
         );
 
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn self_edit_seeds_project_from_the_repository() {
+        let root = env::temp_dir().join(format!("evengate-self-edit-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        for dir in [
+            ".git",
+            "src",
+            "target/debug",
+            "tasks/keep/artifacts",
+            "tasks/keep/project",
+            "tasks/self-edit",
+        ] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        fs::write(root.join("Cargo.toml"), "[package]\nname = \"evengate\"\n").unwrap();
+        fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+        fs::write(root.join("target/debug/junk"), "junk").unwrap();
+        fs::write(root.join("tasks/keep/events.jsonl"), "{}\n").unwrap();
+        fs::write(root.join("tasks/keep/artifacts/junk"), "junk").unwrap();
+        fs::write(root.join("tasks/keep/project/junk"), "junk").unwrap();
+
+        let spec = Spec {
+            title: "Edit the gate".into(),
+            target: vec!["src/main.rs".into()],
+            ..Spec::default()
+        };
+        let ctx = ExecCtx::new(&root.join("tasks/self-edit"), &spec);
+        ctx.seed_self_edit().unwrap();
+
+        let project = root.join("tasks/self-edit/project");
+        assert_eq!(
+            fs::read_to_string(project.join("src/main.rs")).unwrap(),
+            "fn main() {}\n"
+        );
+        assert!(project.join("Cargo.toml").is_file());
+        assert!(!project.join(".git").exists());
+        assert!(!project.join("target").exists());
+        assert!(!project.join("tasks/keep/artifacts").exists());
+        assert!(!project.join("tasks/keep/project").exists());
+        assert!(project.join("tasks/keep/events.jsonl").is_file());
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn self_edit_rejects_a_missing_target() {
+        let root =
+            env::temp_dir().join(format!("evengate-self-edit-missing-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("tasks/self-edit")).unwrap();
+        fs::write(root.join("Cargo.toml"), "[package]\nname = \"evengate\"\n").unwrap();
+
+        let spec = Spec {
+            title: "Edit the gate".into(),
+            target: vec!["src/no-such.rs".into()],
+            ..Spec::default()
+        };
+        let ctx = ExecCtx::new(&root.join("tasks/self-edit"), &spec);
+        let error = ctx.seed_self_edit().unwrap_err();
+        assert!(error.contains("self-edit target does not exist"), "{error}");
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn self_edit_prompt_uses_the_current_tree_and_requires_every_file() {
+        let context = Context {
+            project: "edit-the-gate".into(),
+            title: "Edit the gate".into(),
+            goal: "change the gate".into(),
+            acceptance: Vec::new(),
+            constraints: Vec::new(),
+            non_goals: Vec::new(),
+            target: vec!["src/gate.rs".into()],
+            context: Vec::new(),
+            open_questions: Vec::new(),
+            feedback: Vec::new(),
+        };
+        let mut current = BTreeMap::new();
+        current.insert("src/gate.rs".to_string(), "fn gate() {}\n".to_string());
+
+        let prompt = build_prompt(
+            &context,
+            Path::new("no-such-template-dir"),
+            &[],
+            None,
+            Some(&current),
+        )
+        .unwrap();
+        assert!(prompt.starts_with("Edit the existing Evengate project"));
+        assert!(prompt.contains("## Target\n- src/gate.rs"));
+        assert!(prompt.contains("# Current project"));
+        assert!(prompt.contains("copy of the Evengate repository"));
+        assert!(prompt.contains("complete repository tree, not only the changed files"));
+        assert!(!prompt.contains("# Reference template"));
     }
 
     #[test]
@@ -899,6 +1114,7 @@ mod tests {
             acceptance: vec!["it compiles".into()],
             constraints: Vec::new(),
             non_goals: Vec::new(),
+            target: Vec::new(),
             context: Vec::new(),
             open_questions: Vec::new(),
             feedback: Vec::new(),

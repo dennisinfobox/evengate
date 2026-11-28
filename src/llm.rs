@@ -126,6 +126,12 @@ fn validate_path(path: &str) -> Result<(), String> {
             "manifest path `{path}` uses `\\`; the protocol requires `/`"
         ));
     }
+    // A colon is a Windows drive prefix or an alternate data stream; it is
+    // never valid in a portable project-relative path. Rejecting it here keeps
+    // the verdict identical on Windows and Linux.
+    if path.contains(':') {
+        return Err(format!("manifest path `{path}` contains `:`"));
+    }
     match Path::new(path).components().next() {
         Some(Component::RootDir) | Some(Component::Prefix(_)) => {
             return Err(format!("manifest path `{path}` is absolute"));

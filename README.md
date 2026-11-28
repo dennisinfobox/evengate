@@ -4,13 +4,13 @@ A deterministic, Rust-native software factory that builds and improves itself un
 
 **Evengate** = *event* + *gate*: all state is derived from an append-only event log, and nothing moves without passing a gate.
 
-Status: month 2 — the mandatory gates include `cargo fmt --check`, each task records the gate set it was created under, and merging across a gate-set change needs a reasoned human override. See `docs/STATUS.md`.
+Status: month 2 — self-edit tasks now start from a copy of this repository and run Evengate's own gates on that copy; the mandatory gates include `cargo fmt --check`, each task records its gate set, and merging across a gate-set change needs a reasoned human override. See `docs/STATUS.md`.
 
 ## Documentation
 
 | File | Purpose |
 |---|---|
-| [`docs/spec.md`](docs/spec.md) | Authoritative design, v0.16 |
+| [`docs/spec.md`](docs/spec.md) | Authoritative design, v0.17 |
 | [`docs/STATUS.md`](docs/STATUS.md) | Current phase, next step, blockers |
 | [`docs/DECISIONS.md`](docs/DECISIONS.md) | Decision log with rationale |
 | [`AGENTS.md`](AGENTS.md) | Rules for agents and contributors |
@@ -18,7 +18,7 @@ Status: month 2 — the mandatory gates include `cargo fmt --check`, each task r
 ## Quickstart
 
 ```sh
-docker build -t evengate-sandbox:1.100 sandbox   # once: clippy + rustfmt inside
+docker build -f sandbox/Dockerfile -t evengate-sandbox:1.100 .   # once: clippy, rustfmt, locked deps
 cargo build --locked
 
 # start or resume a task; every task directory carries its own spec.md
@@ -51,6 +51,8 @@ Gate containers run read-only with no network, a read-only project mount, a 1 Gi
 The executing agent defaults to the offline `TemplateClient`. Set `EVENGATE_LLM_URL` (an OpenAI-compatible chat-completions endpoint) to switch to `LiveClient`; `EVENGATE_LLM=template|live|recorded` overrides the choice. Live requests ask for a JSON object (`response_format`), so a model cannot return an unescaped-quote reply. Live mode reads `EVENGATE_LLM_API_KEY`, `EVENGATE_MODEL_EXECUTOR`/`_PLANNER`/`_REVIEWER` (fallback `EVENGATE_MODEL`), `EVENGATE_LLM_TIMEOUT_SECS`, and `EVENGATE_LLM_MAX_TOKENS`.
 
 The `ReviewAgent` gate is mandatory and needs a model. With no endpoint configured, `ev run` executes the template agent and the four deterministic gates — `cargo check`, `cargo test`, `cargo clippy -- -D warnings`, and `cargo fmt --check` — then stops at the review gate with an actionable error; re-run with `EVENGATE_LLM_URL` set to finish the review and open the PR. `ev replay` is always offline.
+
+A task spec with a `## Target` bullet under `src/` is a self-edit. Its first invocation copies this repository into `tasks/<task-dir>/project/` (without `.git`, `target`, `.tmp`, or generated task artifacts), sends that tree to the executor, and requires the complete tree back. The gates judge that copy in the sandbox, so the live checkout is untouched. A self-edit needs a model: the offline template agent refuses, because rendering `templates/bin` would replace Evengate with an unrelated crate. The sandbox image pre-fetches the locked dependency set at build time, so `cargo check`, `test`, `clippy`, and `fmt` run offline on the copy.
 
 `TaskCreated` records the mandatory gate set in force for that task, so adding or removing a gate never reinterprets an old log. A task whose recorded set differs from the running binary's can merge only with `ev approve <task-dir> --reviewer <name> --reason <text>`; a bare approval stops at `RequestHumanReview`.
 

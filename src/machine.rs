@@ -29,6 +29,9 @@ pub struct Context {
     pub acceptance: Vec<String>,
     pub constraints: Vec<String>,
     pub non_goals: Vec<String>,
+    /// Repository-relative files a self-edit may change.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub target: Vec<String>,
     pub context: Vec<String>,
     pub open_questions: Vec<String>,
     /// Gate failures and human guidance that the next revision must address.
@@ -44,6 +47,7 @@ impl Context {
             acceptance: spec.acceptance.clone(),
             constraints: spec.constraints.clone(),
             non_goals: spec.non_goals.clone(),
+            target: spec.target.clone(),
             context: spec.context.clone(),
             open_questions: spec.open_questions.clone(),
             feedback: Vec::new(),

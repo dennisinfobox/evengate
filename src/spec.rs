@@ -11,8 +11,26 @@ pub struct Spec {
     pub acceptance: Vec<String>,
     pub constraints: Vec<String>,
     pub non_goals: Vec<String>,
+    /// Repository-relative files this task edits. A target under `src/` makes
+    /// the task a self-improvement task (docs/spec.md §10.2).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub target: Vec<String>,
     pub context: Vec<String>,
     pub open_questions: Vec<String>,
+}
+
+impl Spec {
+    /// A task is a self-edit when it targets Evengate's own `src/`.
+    pub fn is_self_edit(&self) -> bool {
+        self.target.iter().any(|path| targets_self(path))
+    }
+}
+
+/// Whether a repository-relative target points under `src/`.
+pub fn targets_self(path: &str) -> bool {
+    let normalized = path.trim().replace('\\', "/");
+    let normalized = normalized.strip_prefix("./").unwrap_or(&normalized);
+    normalized == "src" || normalized.starts_with("src/")
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -38,6 +56,7 @@ enum Section {
     Acceptance,
     Constraints,
     NonGoals,
+    Target,
     Context,
     OpenQuestions,
     Other,
@@ -56,6 +75,7 @@ pub fn parse(markdown: &str) -> Result<Spec, SpecError> {
                 "acceptance" => Section::Acceptance,
                 "constraints" => Section::Constraints,
                 "non-goals" | "non goals" => Section::NonGoals,
+                "target" => Section::Target,
                 "context" => Section::Context,
                 "open questions" => Section::OpenQuestions,
                 _ => Section::Other,
@@ -73,6 +93,7 @@ pub fn parse(markdown: &str) -> Result<Spec, SpecError> {
             Section::Acceptance => push_bullet(&mut spec.acceptance, line),
             Section::Constraints => push_bullet(&mut spec.constraints, line),
             Section::NonGoals => push_bullet(&mut spec.non_goals, line),
+            Section::Target => push_bullet(&mut spec.target, line),
             Section::Context => push_bullet(&mut spec.context, line),
             Section::OpenQuestions => push_bullet(&mut spec.open_questions, line),
             Section::None | Section::Other => {}
@@ -200,6 +221,56 @@ None.
     fn rejects_multi_paragraph_goal() {
         let text = "# t\n\n## Goal\nfirst\n\nsecond\n\n## Acceptance\n- a\n\n## Constraints\n- c\n";
         assert!(parse(text).is_err());
+    }
+
+    #[test]
+    fn target_section_marks_self_edits() {
+        let text = "\
+# Gate Tweak
+
+## Goal
+Change a gate.
+
+## Acceptance
+- [ ] it works
+
+## Constraints
+- no new crates
+
+## Target
+- src/gate.rs
+- docs/spec.md
+";
+        let spec = parse(text).unwrap();
+        assert_eq!(spec.target, vec!["src/gate.rs", "docs/spec.md"]);
+        assert!(spec.is_self_edit());
+
+        let spec = parse(VALID).unwrap();
+        assert!(spec.target.is_empty());
+        assert!(!spec.is_self_edit());
+    }
+
+    #[test]
+    fn self_edit_targets_are_normalized() {
+        assert!(targets_self("src"));
+        assert!(targets_self("src/gate.rs"));
+        assert!(targets_self("./src/gate.rs"));
+        assert!(targets_self("src\\gate.rs"));
+        assert!(!targets_self("docs/spec.md"));
+        assert!(!targets_self("srcs/gate.rs"));
+        assert!(!targets_self(""));
+    }
+
+    #[test]
+    fn empty_target_serializes_like_a_legacy_spec() {
+        let spec = parse(VALID).unwrap();
+        let json = serde_json::to_string(&spec).unwrap();
+        assert!(!json.contains("target"), "{json}");
+
+        let with_target = parse("# t\n\n## Goal\ng\n\n## Acceptance\n- a\n\n## Constraints\n- c\n\n## Target\n- src/main.rs\n").unwrap();
+        assert!(serde_json::to_string(&with_target)
+            .unwrap()
+            .contains("\"target\":[\"src/main.rs\"]"));
     }
 
     #[test]
