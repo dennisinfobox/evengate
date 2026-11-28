@@ -280,4 +280,18 @@ Change a gate.
         assert_eq!(slug("  "), "task");
         assert_eq!(slug("9 lives"), "task-9-lives");
     }
+
+    #[test]
+    fn slug_collapses_consecutive_non_alphanumeric_characters() {
+        assert_eq!(slug("a---b"), "a-b");
+        assert_eq!(slug("a  b"), "a-b");
+        assert_eq!(slug("a--b"), "a-b");
+    }
+
+    #[test]
+    fn slug_trims_leading_and_trailing_non_alphanumeric_characters() {
+        assert_eq!(slug("-a-b-"), "a-b");
+        assert_eq!(slug("a-b-"), "a-b");
+        assert_eq!(slug("-a-b"), "a-b");
+    }
 }

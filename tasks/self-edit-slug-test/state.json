@@ -1,0 +1,107 @@
+{
+  "phase": "merged",
+  "task_created": true,
+  "spec": {
+    "title": "Cover Slug Separator Runs",
+    "goal": "Add a unit test proving that `slug` collapses a run of non-alphanumeric characters into a single dash.",
+    "acceptance": [
+      "A new test in `src/spec.rs` asserts `slug(\"a---b\") == \"a-b\"`.",
+      "The same test asserts `slug(\"a   b\") == \"a-b\"`.",
+      "`cargo test --locked` passes."
+    ],
+    "constraints": [
+      "Change only `src/spec.rs`.",
+      "No new crates.",
+      "Do not change the behavior of `slug`; only add the test."
+    ],
+    "non_goals": [
+      "No parser or target validation changes."
+    ],
+    "target": [
+      "src/spec.rs"
+    ],
+    "context": [
+      "`src/spec.rs` already has a `slugs_are_filesystem_safe` test; add the new case next to it."
+    ],
+    "open_questions": []
+  },
+  "gates": [
+    "compiles",
+    "tests_pass",
+    "lints_clean",
+    "format_clean",
+    "review_agent"
+  ],
+  "artifacts": [
+    {
+      "path": "project",
+      "kind": "tree"
+    }
+  ],
+  "gate_results": {
+    "compiles": {
+      "result": "pass"
+    },
+    "tests_pass": {
+      "result": "pass"
+    },
+    "lints_clean": {
+      "result": "pass"
+    },
+    "format_clean": {
+      "result": "pass"
+    },
+    "review_agent": {
+      "result": "pass"
+    }
+  },
+  "gate_attempts": {
+    "compiles": 1,
+    "tests_pass": 1,
+    "lints_clean": 1,
+    "format_clean": 1,
+    "review_agent": 1
+  },
+  "revisions": 0,
+  "revision_failures": {},
+  "revision_guidance": null,
+  "token_spend": {
+    "input": 6006,
+    "output": 2197
+  },
+  "human_decision": {
+    "decision": "approved",
+    "reviewer": "Dennis"
+  },
+  "agent_invocations": 2,
+  "agent_responses": 2,
+  "pr_url": "file:///C:/Users/Dennis/source/repos/evengate/tasks/self-edit-slug-test/artifacts/remote.git#ev/cover-slug-separator-runs",
+  "merged_commit": "6d1bf17b0dad863bcdf5563f7c70ab678de4580a",
+  "abandoned_reason": null,
+  "last_tick": null,
+  "anomalies": [],
+  "repeated_lessons": {
+    "handling edge cases, such as very large or small numbers, can enhance the robustness of the application.": {
+      "text": "Handling edge cases, such as very large or small numbers, can enhance the robustness of the application.",
+      "count": 4
+    },
+    "keep the dependencies minimal to adhere to the constraints.": {
+      "text": "Keep the dependencies minimal to adhere to the constraints.",
+      "count": 4
+    },
+    "remember to use `cargo clippy` to catch potential warnings and improve code quality.": {
+      "text": "Remember to use `cargo clippy` to catch potential warnings and improve code quality.",
+      "count": 4
+    },
+    "unit tests are crucial for validating both valid and invalid inputs.": {
+      "text": "Unit tests are crucial for validating both valid and invalid inputs.",
+      "count": 4
+    }
+  },
+  "promotion_decisions": {
+    "handling edge cases, such as very large or small numbers, can enhance the robustness of the application.": "dismissed",
+    "keep the dependencies minimal to adhere to the constraints.": "dismissed",
+    "remember to use `cargo clippy` to catch potential warnings and improve code quality.": "dismissed",
+    "unit tests are crucial for validating both valid and invalid inputs.": "dismissed"
+  }
+}
